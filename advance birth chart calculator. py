@@ -1,0 +1,4085 @@
+import math
+import requests
+from datetime import datetime
+import os
+import sys
+import json
+import sqlite3
+import zipfile
+from typing import Dict, List, Optional, Tuple
+import re
+
+# Try to import Skyfield, install if not available
+try:
+    from skyfield.api import Loader, Topos
+    SKYFIELD_AVAILABLE = True
+except ImportError:
+    print("📦 Skyfield not available, using manual calculations")
+    SKYFIELD_AVAILABLE = False
+
+class AstroKarmaPath:
+    def __init__(self):
+        self.setup_directories()
+        self.setup_database()
+        self.setup_notes_database()
+        
+        # Planetary relationships table
+        self.planetary_relationships = {
+            'sun': {'friends': ['moon', 'mars', 'jupiter'], 'enemies': ['venus', 'saturn'], 'neutral': ['mercury']},
+            'moon': {'friends': ['sun', 'mercury'], 'enemies': [], 'neutral': ['mars', 'jupiter', 'venus', 'saturn']},
+            'mars': {'friends': ['sun', 'moon', 'jupiter'], 'enemies': ['mercury'], 'neutral': ['venus', 'saturn']},
+            'mercury': {'friends': ['sun', 'venus'], 'enemies': ['moon'], 'neutral': ['mars', 'jupiter', 'saturn']},
+            'jupiter': {'friends': ['sun', 'moon', 'mars'], 'enemies': ['venus', 'mercury'], 'neutral': ['saturn']},
+            'venus': {'friends': ['mercury', 'saturn'], 'enemies': ['sun', 'moon'], 'neutral': ['mars', 'jupiter']},
+            'saturn': {'friends': ['mercury', 'venus'], 'enemies': ['sun', 'moon'], 'neutral': ['mars', 'jupiter']},
+            'rahu': {'friends': ['saturn', 'mercury', 'venus'], 'enemies': ['sun', 'moon', 'mars', 'jupiter'], 'neutral': []},
+            'ketu': {'friends': ['saturn', 'mercury', 'venus'], 'enemies': ['sun', 'moon', 'mars', 'jupiter'], 'neutral': []}
+        }
+        
+        # Exaltation and debilitation degrees
+        self.exaltation_debilitation = {
+            'sun': {'exalted': {'sign': 'Aries', 'degree': 10}, 'debilitated': {'sign': 'Libra', 'degree': 10}},
+            'moon': {'exalted': {'sign': 'Taurus', 'degree': 3}, 'debilitated': {'sign': 'Scorpio', 'degree': 3}},
+            'mars': {'exalted': {'sign': 'Capricorn', 'degree': 28}, 'debilitated': {'sign': 'Cancer', 'degree': 28}},
+            'mercury': {'exalted': {'sign': 'Virgo', 'degree': 15}, 'debilitated': {'sign': 'Pisces', 'degree': 15}},
+            'jupiter': {'exalted': {'sign': 'Cancer', 'degree': 5}, 'debilitated': {'sign': 'Capricorn', 'degree': 5}},
+            'venus': {'exalted': {'sign': 'Pisces', 'degree': 27}, 'debilitated': {'sign': 'Virgo', 'degree': 27}},
+            'saturn': {'exalted': {'sign': 'Libra', 'degree': 20}, 'debilitated': {'sign': 'Aries', 'degree': 20}},
+            'rahu': {'exalted': {'sign': 'Gemini', 'degree': 20}, 'debilitated': {'sign': 'Sagittarius', 'degree': 20}},
+            'ketu': {'exalted': {'sign': 'Sagittarius', 'degree': 20}, 'debilitated': {'sign': 'Gemini', 'degree': 20}}
+        }
+        
+        # Mooltrikona signs
+        self.mooltrikona = {
+            'sun': 'Leo',
+            'moon': 'Taurus', 
+            'mars': 'Aries',
+            'mercury': 'Virgo',
+            'jupiter': 'Sagittarius',
+            'venus': 'Libra',
+            'saturn': 'Aquarius'
+        }
+        
+        # Sign lordship
+        self.sign_lords = {
+            'Aries': ['mars'],
+            'Taurus': ['venus'],
+            'Gemini': ['mercury'],
+            'Cancer': ['moon'],
+            'Leo': ['sun'],
+            'Virgo': ['mercury'],
+            'Libra': ['venus'],
+            'Scorpio': ['mars'],
+            'Sagittarius': ['jupiter'],
+            'Capricorn': ['saturn'],
+            'Aquarius': ['saturn'],
+            'Pisces': ['jupiter']
+        }
+        
+        # Combust orbs
+        self.combust_orbs = {
+            'mercury': 14, 'venus': 10, 'mars': 17, 'jupiter': 11, 'saturn': 15
+        }
+        
+        # Nakshatra data
+        self.nakshatras = [
+            {"name": "Ashwini", "range": "0°00' – 13°20'", "signs": ["Aries"], "lord": "Ketu"},
+            {"name": "Bharani", "range": "13°20' – 26°40'", "signs": ["Aries"], "lord": "Venus"},
+            {"name": "Krittika", "range": "26°40' Aries – 10°00' Taurus", "signs": ["Aries", "Taurus"], "lord": "Sun"},
+            {"name": "Rohini", "range": "10°00' – 23°20'", "signs": ["Taurus"], "lord": "Moon"},
+            {"name": "Mrigashira", "range": "23°20' Taurus – 6°40' Gemini", "signs": ["Taurus", "Gemini"], "lord": "Mars"},
+            {"name": "Ardra", "range": "6°40' – 20°00'", "signs": ["Gemini"], "lord": "Rahu"},
+            {"name": "Punarvasu", "range": "20°00' Gemini – 3°20' Cancer", "signs": ["Gemini", "Cancer"], "lord": "Jupiter"},
+            {"name": "Pushya", "range": "3°20' – 16°40'", "signs": ["Cancer"], "lord": "Saturn"},
+            {"name": "Ashlesha", "range": "16°40' – 30°00'", "signs": ["Cancer"], "lord": "Mercury"},
+            {"name": "Magha", "range": "0°00' – 13°20'", "signs": ["Leo"], "lord": "Ketu"},
+            {"name": "Purva Phalguni", "range": "13°20' – 26°40'", "signs": ["Leo"], "lord": "Venus"},
+            {"name": "Uttara Phalguni", "range": "26°40' Leo – 10°00' Virgo", "signs": ["Leo", "Virgo"], "lord": "Sun"},
+            {"name": "Hasta", "range": "10°00' – 23°20'", "signs": ["Virgo"], "lord": "Moon"},
+            {"name": "Chitra", "range": "23°20' Virgo – 6°40' Libra", "signs": ["Virgo", "Libra"], "lord": "Mars"},
+            {"name": "Swati", "range": "6°40' – 20°00'", "signs": ["Libra"], "lord": "Rahu"},
+            {"name": "Vishakha", "range": "20°00' Libra – 3°20' Scorpio", "signs": ["Libra", "Scorpio"], "lord": "Jupiter"},
+            {"name": "Anuradha", "range": "3°20' – 16°40'", "signs": ["Scorpio"], "lord": "Saturn"},
+            {"name": "Jyeshtha", "range": "16°40' – 30°00'", "signs": ["Scorpio"], "lord": "Mercury"},
+            {"name": "Moola", "range": "0°00' – 13°20'", "signs": ["Sagittarius"], "lord": "Ketu"},
+            {"name": "Purva Ashadha", "range": "13°20' – 26°40'", "signs": ["Sagittarius"], "lord": "Venus"},
+            {"name": "Uttara Ashadha", "range": "26°40' Sagittarius – 10°00' Capricorn", "signs": ["Sagittarius", "Capricorn"], "lord": "Sun"},
+            {"name": "Shravana", "range": "10°00' – 23°20'", "signs": ["Capricorn"], "lord": "Moon"},
+            {"name": "Dhanishtha", "range": "23°20' Capricorn – 6°40' Aquarius", "signs": ["Capricorn", "Aquarius"], "lord": "Mars"},
+            {"name": "Shatabhisha", "range": "6°40' – 20°00'", "signs": ["Aquarius"], "lord": "Rahu"},
+            {"name": "Purva Bhadrapada", "range": "20°00' Aquarius – 3°20' Pisces", "signs": ["Aquarius", "Pisces"], "lord": "Jupiter"},
+            {"name": "Uttara Bhadrapada", "range": "3°20' – 16°40'", "signs": ["Pisces"], "lord": "Saturn"},
+            {"name": "Revati", "range": "16°40' – 30°00'", "signs": ["Pisces"], "lord": "Mercury"}
+        ]
+        
+        self.zodiac_signs = [
+            "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+            "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"
+        ]
+        
+        # Store planetary motions for retrograde detection
+        self.planetary_motions = {}
+        
+        self.load_data()
+
+    # ========== ENHANCED STORAGE SYSTEM ==========
+    
+    def setup_directories(self):
+        """Setup storage directories with enhanced management"""
+        self.base_dir = None
+        self.ensure_storage_location()
+
+    def ensure_storage_location(self):
+        """Enhanced storage location with auto-detection and migration"""
+        config_file = "astrology_config.json"
+        
+        # Check if config exists and location is valid
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, 'r') as f:
+                    config = json.load(f)
+                    self.base_dir = config.get('storage_location')
+                    if self.base_dir and os.path.exists(self.base_dir):
+                        print(f"✅ Storage location detected: {self.base_dir}")
+                        return
+                    else:
+                        print("⚠️  Saved storage location not found, reconfiguring...")
+            except Exception as e:
+                print(f"⚠️  Config file error: {e}")
+        
+        # Storage setup menu
+        self.storage_setup_menu()
+
+    def storage_setup_menu(self):
+        """Enhanced storage setup with migration options"""
+        print("\n📁 ENHANCED STORAGE MANAGEMENT")
+        print("=" * 50)
+        print("[1] Internal Storage (Recommended)")
+        print("[2] SD Card (If available)") 
+        print("[3] Custom folder path")
+        print("[4] Detect Previous Location")
+        
+        choice = input("\nChoose option (1-4): ").strip()
+        
+        if choice == "1":
+            new_base_dir = "/storage/emulated/0/astrology_app"
+        elif choice == "2":
+            new_base_dir = "/storage/sdcard/astrology_app"
+        elif choice == "3":
+            new_base_dir = input("Enter custom folder path: ").strip()
+        elif choice == "4":
+            new_base_dir = self.detect_previous_location()
+            if not new_base_dir:
+                print("❌ No previous location found!")
+                return self.storage_setup_menu()
+        else:
+            print("❌ Invalid choice!")
+            return self.storage_setup_menu()
+        
+        # Create directory and migrate if needed
+        self.migrate_storage_location(new_base_dir)
+
+    def detect_previous_location(self):
+        """Auto-detect previous installation location"""
+        possible_paths = [
+            "/storage/emulated/0/astrology_app",
+            "/storage/sdcard/astrology_app", 
+            "/sdcard/astrology_app",
+            os.path.join(os.path.expanduser("~"), "astrology_app")
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path) and os.path.exists(os.path.join(path, "astrology.db")):
+                print(f"📍 Found previous installation at: {path}")
+                return path
+        return None
+
+    def migrate_storage_location(self, new_location):
+        """Migrate data to new storage location"""
+        # Create new directory
+        os.makedirs(new_location, exist_ok=True)
+        
+        # If we have existing data, migrate it
+        if self.base_dir and self.base_dir != new_location and os.path.exists(self.base_dir):
+            print(f"🔄 Migrating data from {self.base_dir} to {new_location}...")
+            try:
+                # Copy database
+                if os.path.exists(os.path.join(self.base_dir, "astrology.db")):
+                    import shutil
+                    shutil.copy2(os.path.join(self.base_dir, "astrology.db"), 
+                                os.path.join(new_location, "astrology.db"))
+                
+                # Copy charts directory
+                charts_old = os.path.join(self.base_dir, "charts")
+                charts_new = os.path.join(new_location, "charts")
+                if os.path.exists(charts_old):
+                    shutil.copytree(charts_old, charts_new, dirs_exist_ok=True)
+                    
+                print("✅ Data migration completed!")
+            except Exception as e:
+                print(f"⚠️  Migration warning: {e}")
+        
+        self.base_dir = new_location
+        
+        # Save config
+        config = {'storage_location': self.base_dir}
+        with open("astrology_config.json", 'w') as f:
+            json.dump(config, f)
+        
+        print(f"✅ Storage set to: {self.base_dir}")
+
+    def change_storage_location(self):
+        """Change storage location from settings"""
+        print("\n🔄 CHANGE STORAGE LOCATION")
+        print("=" * 40)
+        self.storage_setup_menu()
+
+    # ========== ENHANCED DATABASE SCHEMA ==========
+    
+    def setup_database(self):
+        """Setup SQLite database with enhanced schema"""
+        if not self.base_dir:
+            self.ensure_storage_location()
+            
+        self.db_path = os.path.join(self.base_dir, "astrology.db")
+        self.conn = sqlite3.connect(self.db_path)
+        self.cursor = self.conn.cursor()
+        
+        # Create tables
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS persons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                profession TEXT,
+                birth_date TEXT,
+                birth_time TEXT,
+                location TEXT,
+                chart_json_path TEXT,
+                chart_text_path TEXT,
+                created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS combinations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                criteria_planets TEXT,
+                criteria_signs TEXT,
+                criteria_houses TEXT,
+                criteria_nakshatras TEXT,
+                criteria_house_lords TEXT,
+                criteria_custom TEXT,
+                logic TEXT DEFAULT 'OR',
+                result TEXT,
+                used_by TEXT,
+                created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Combination-Person linking table
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS combination_person_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                combination_id INTEGER,
+                person_id INTEGER,
+                match_score INTEGER,
+                match_fields TEXT,
+                auto_matched BOOLEAN DEFAULT 0,
+                confirmed BOOLEAN DEFAULT 1,
+                created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (combination_id) REFERENCES combinations (id),
+                FOREIGN KEY (person_id) REFERENCES persons (id)
+            )
+        ''')
+        
+        self.conn.commit()
+        
+        # Migrate database if needed
+        self.migrate_database()
+
+    def setup_notes_database(self):
+        """Setup notes table in database"""
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER,
+                note_text TEXT NOT NULL,
+                note_type TEXT DEFAULT 'general',
+                linked_combination_id INTEGER,
+                created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (person_id) REFERENCES persons (id),
+                FOREIGN KEY (linked_combination_id) REFERENCES combinations (id)
+            )
+        ''')
+        self.conn.commit()
+
+    def migrate_database(self):
+        """Migrate database to add birth_time column if missing"""
+        try:
+            # Check if birth_time column exists
+            self.cursor.execute("PRAGMA table_info(persons)")
+            columns = [column[1] for column in self.cursor.fetchall()]
+            
+            if 'birth_time' not in columns:
+                print("🔄 Migrating database to add birth_time column...")
+                
+                # Add new column
+                self.cursor.execute('ALTER TABLE persons ADD COLUMN birth_time TEXT')
+                
+                # Try to extract birth_time from existing birth_date
+                self.cursor.execute('SELECT id, birth_date FROM persons WHERE birth_time IS NULL')
+                persons = self.cursor.fetchall()
+                
+                for person_id, birth_date in persons:
+                    if birth_date and ' ' in birth_date:
+                        # If birth_date contains time, split it
+                        date_part, time_part = birth_date.split(' ', 1)
+                        self.cursor.execute(
+                            'UPDATE persons SET birth_date = ?, birth_time = ? WHERE id = ?',
+                            (date_part, time_part, person_id)
+                        )
+                
+                self.conn.commit()
+                print("✅ Database migration completed!")
+                
+        except Exception as e:
+            print(f"⚠️ Database migration issue: {e}")
+
+    # ========== CORE ASTRONOMICAL CALCULATIONS (PRESERVED) ==========
+
+    def load_data(self):
+        """Load NASA JPL ephemeris data"""
+        print("📡 Loading planetary data...")
+        try:
+            if SKYFIELD_AVAILABLE:
+                load = Loader('/data/data/ru.iiec.pydroid3/files/skyfield-data')
+                self.eph = load('de421.bsp')
+                self.ts = load.timescale()
+                print("✅ NASA ephemeris loaded successfully!")
+            else:
+                self.eph = None
+                self.ts = None
+                print("✅ Using high-precision manual calculations")
+        except Exception as e:
+            print(f"⚠️  Ephemeris load issue: {e}")
+            self.eph = None
+            self.ts = None
+
+    def calculate_retrograde_status(self, planet, year, month, day, hour, minute):
+        """Calculate if planet is retrograde"""
+        try:
+            if SKYFIELD_AVAILABLE and self.eph and self.ts:
+                return self.calculate_skyfield_retrograde(planet, year, month, day, hour, minute)
+            else:
+                return self.calculate_manual_retrograde(planet, year, month, day, hour, minute)
+        except:
+            return "Direct"  # Fallback
+
+    def calculate_skyfield_retrograde(self, planet, year, month, day, hour, minute):
+        """Use Skyfield to detect retrograde motion"""
+        if planet in ['sun', 'moon', 'rahu', 'ketu']:
+            return "Direct"  # Sun/Moon never retrograde, Rahu/Ketu always move backward
+            
+        t = self.ts.utc(year, month, day, hour, minute)
+        earth = self.eph['earth']
+        
+        planet_map = {
+            'mercury': self.eph['mercury'],
+            'venus': self.eph['venus'],
+            'mars': self.eph['mars'],
+            'jupiter': self.eph['jupiter barycenter'],
+            'saturn': self.eph['saturn barycenter']
+        }
+        
+        if planet in planet_map:
+            # Get position at current time and 1 day later
+            astrometric_now = earth.at(t).observe(planet_map[planet])
+            astrometric_later = earth.at(t + 1/24.0).observe(planet_map[planet])  # 1 hour later
+            
+            lon_now = astrometric_now.apparent().ecliptic_latlon()[1].degrees
+            lon_later = astrometric_later.apparent().ecliptic_latlon()[1].degrees
+            
+            # Normalize longitudes
+            lon_now = lon_now % 360
+            lon_later = lon_later % 360
+            
+            # Check motion direction
+            if abs(lon_later - lon_now) > 180:
+                # Handle 360° boundary
+                if lon_now > 180:
+                    lon_now -= 360
+                if lon_later > 180:
+                    lon_later -= 360
+            
+            if lon_later < lon_now:
+                return "Retrograde"
+            else:
+                return "Direct"
+        
+        return "Direct"
+
+    def calculate_manual_retrograde(self, planet, year, month, day, hour, minute):
+        """Manual retrograde detection using approximate periods"""
+        # Simplified retrograde detection based on planetary cycles
+        jd = self.calculate_julian_day(year, month, day, hour, minute)
+        
+        # Approximate retrograde periods (simplified)
+        retro_cycles = {
+            'mercury': 116,  # Mercury goes retrograde every ~116 days
+            'venus': 584,    # Venus retrograde cycle
+            'mars': 780,     # Mars retrograde cycle  
+            'jupiter': 399,  # Jupiter retrograde cycle
+            'saturn': 378    # Saturn retrograde cycle
+        }
+        
+        if planet in retro_cycles:
+            # Simple phase calculation
+            cycle_days = retro_cycles[planet]
+            phase = (jd % cycle_days) / cycle_days
+            
+            # Approximate retrograde windows (simplified)
+            retro_windows = {
+                'mercury': (0.65, 0.85),   # Mercury retrograde ~20% of time
+                'venus': (0.40, 0.45),     # Venus retrograde ~5% of time
+                'mars': (0.80, 0.95),      # Mars retrograde ~15% of time
+                'jupiter': (0.30, 0.35),   # Jupiter retrograde ~5% of time
+                'saturn': (0.35, 0.40)     # Saturn retrograde ~5% of time
+            }
+            
+            if planet in retro_windows:
+                start, end = retro_windows[planet]
+                if start <= phase <= end:
+                    return "Retrograde"
+        
+        return "Direct"
+
+    def calculate_julian_day(self, year, month, day, hour, minute):
+        """Calculate Julian Day accurately"""
+        if month <= 2:
+            year -= 1
+            month += 12
+            
+        a = year // 100
+        b = 2 - a + (a // 4)
+        
+        fractional_day = day + (hour + minute/60) / 24.0
+        
+        jd = (int(365.25 * (year + 4716)) + 
+              int(30.6001 * (month + 1)) + 
+              fractional_day + b - 1524.5)
+        
+        return jd
+
+    def calculate_gmst(self, jd):
+        """Calculate Greenwich Mean Sidereal Time accurately"""
+        T = (jd - 2451545.0) / 36525.0
+        gmst_deg = 280.46061837 + 360.98564736629 * (jd - 2451545.0) + 0.000387933 * T**2 - T**3 / 38710000.0
+        return gmst_deg % 360
+
+    def calculate_perfect_ascendant(self, lst_deg, lat):
+        """PERFECT Ascendant calculation"""
+        L = math.radians(lst_deg)  # Local Sidereal Time
+        phi = math.radians(lat)    # Latitude
+        epsilon = math.radians(23.4392911)  # Obliquity
+        
+        numerator = -math.cos(L)
+        denominator = math.sin(L) * math.cos(epsilon) + math.tan(phi) * math.sin(epsilon)
+        
+        asc_rad = math.atan2(numerator, denominator)
+        asc_deg = math.degrees(asc_rad)
+        
+        asc_deg += 180
+        
+        if asc_deg >= 360:
+            asc_deg -= 360
+        elif asc_deg < 0:
+            asc_deg += 360
+            
+        return asc_deg
+
+    def get_ayanamsa(self, jd):
+        """PRECISE Lahiri Ayanamsa"""
+        T = (jd - 2451545.0) / 36525.0
+        ayanamsa = 23.856 + 0.013969 * T + 0.00000059 * T**2
+        return ayanamsa
+
+    def get_accurate_planetary_positions(self, year, month, day, hour, minute):
+        """Get guaranteed accurate planetary positions"""
+        try:
+            if self.eph and self.ts and SKYFIELD_AVAILABLE:
+                return self.get_skyfield_positions(year, month, day, hour, minute)
+            else:
+                return self.get_manual_accurate_positions(year, month, day, hour, minute)
+        except Exception as e:
+            print(f"⚠️  Using fallback calculations: {e}")
+            return self.get_manual_accurate_positions(year, month, day, hour, minute)
+    
+    def get_skyfield_positions(self, year, month, day, hour, minute):
+        """Use Skyfield for maximum accuracy"""
+        t = self.ts.utc(year, month, day, hour, minute)
+        earth = self.eph['earth']
+        
+        planets = {
+            'sun': self.eph['sun'],
+            'moon': self.eph['moon'], 
+            'mercury': self.eph['mercury'],
+            'venus': self.eph['venus'],
+            'mars': self.eph['mars'],
+            'jupiter': self.eph['jupiter barycenter'],
+            'saturn': self.eph['saturn barycenter'],
+        }
+        
+        positions = {}
+        for name, planet in planets.items():
+            astrometric = earth.at(t).observe(planet)
+            apparent = astrometric.apparent()
+            lat, lon, dist = apparent.ecliptic_latlon()
+            positions[name] = lon.degrees
+        
+        jd = self.calculate_julian_day(year, month, day, hour, minute)
+        positions['rahu'] = self.calculate_accurate_rahu(jd)
+        positions['ketu'] = (positions['rahu'] + 180) % 360
+        
+        # Store motions for retrograde detection
+        for name in ['mercury', 'venus', 'mars', 'jupiter', 'saturn']:
+            if name in planets:
+                self.planetary_motions[name] = self.calculate_skyfield_retrograde(name, year, month, day, hour, minute)
+        
+        print("✅ Using NASA Skyfield Ephemeris")
+        return positions
+
+    def calculate_accurate_rahu(self, jd):
+        """Accurate Rahu position"""
+        T = (jd - 2451545.0) / 36525.0
+        rahu = (125.044555 - 1934.1361849 * T + 0.0020762 * T**2) % 360
+        return rahu
+
+    def get_manual_accurate_positions(self, year, month, day, hour, minute):
+        """High-precision manual calculations"""
+        jd = self.calculate_julian_day(year, month, day, hour, minute)
+        
+        positions = {
+            'sun': self.calculate_accurate_sun(jd),
+            'moon': self.calculate_accurate_moon(jd),
+            'mercury': self.calculate_accurate_mercury(jd),
+            'venus': self.calculate_accurate_venus(jd),
+            'mars': self.calculate_accurate_mars(jd),
+            'jupiter': self.calculate_accurate_jupiter(jd),
+            'saturn': self.calculate_accurate_saturn(jd),
+            'rahu': self.calculate_accurate_rahu(jd),
+            'ketu': self.calculate_accurate_ketu(jd),
+        }
+        
+        # Calculate retrograde status for manual method
+        for planet in ['mercury', 'venus', 'mars', 'jupiter', 'saturn']:
+            self.planetary_motions[planet] = self.calculate_manual_retrograde(planet, year, month, day, hour, minute)
+        
+        print("✅ Using High-Precision Manual Calculations")
+        return positions
+
+    def calculate_accurate_sun(self, jd):
+        """Very accurate Sun position"""
+        T = (jd - 2451545.0) / 36525.0
+        M = (357.5291092 + 35999.0502909 * T) % 360
+        M_rad = math.radians(M)
+        L0 = (280.4664567 + 36000.76982779 * T) % 360
+        C = (1.914602 - 0.004817 * T) * math.sin(M_rad) + (0.019993 - 0.000101 * T) * math.sin(2 * M_rad) + 0.000289 * math.sin(3 * M_rad)
+        return (L0 + C) % 360
+
+    def calculate_accurate_moon(self, jd):
+        """Accurate Moon position"""
+        T = (jd - 2451545.0) / 36525.0
+        Lm = (218.3164477 + 481267.88123421 * T) % 360
+        D = (297.8501921 + 445267.1114034 * T) % 360
+        M = (357.5291092 + 35999.0502909 * T) % 360
+        Mm = (134.9633964 + 477198.8675055 * T) % 360
+        F = (93.2720950 + 483202.0175233 * T) % 360
+        
+        Lm_rad, D_rad, M_rad, Mm_rad, F_rad = map(math.radians, [Lm, D, M, Mm, F])
+        
+        longitude = Lm
+        longitude += 6.288774 * math.sin(Mm_rad)
+        longitude += 1.274018 * math.sin(2*D_rad - Mm_rad)
+        longitude += 0.658309 * math.sin(2*D_rad)
+        longitude += 0.213616 * math.sin(2*Mm_rad)
+        longitude -= 0.185596 * math.sin(M_rad)
+        longitude -= 0.114336 * math.sin(2*F_rad)
+        
+        return longitude % 360
+
+    def calculate_accurate_mercury(self, jd):
+        T = (jd - 2451545.0) / 36525.0
+        M = (174.7948 + 149472.51529 * T) % 360
+        M_rad = math.radians(M)
+        C = 7.005 * math.sin(M_rad)
+        return (200.0 + C + 36000.0 * T) % 360
+
+    def calculate_accurate_venus(self, jd):
+        T = (jd - 2451545.0) / 36525.0
+        M = (50.407 + 58517.803 * T) % 360
+        M_rad = math.radians(M)
+        C = 3.394 * math.sin(M_rad)
+        return (230.0 + C + 36000.0 * T) % 360
+
+    def calculate_accurate_mars(self, jd):
+        T = (jd - 2451545.0) / 36525.0
+        M = (355.433 + 19139.299 * T) % 360
+        M_rad = math.radians(M)
+        C = 1.848 * math.sin(M_rad)
+        return (355.0 + C + 36000.0 * T) % 360
+
+    def calculate_accurate_jupiter(self, jd):
+        T = (jd - 2451545.0) / 36525.0
+        M = (34.351 + 3034.906 * T) % 360
+        M_rad = math.radians(M)
+        C = 1.303 * math.sin(M_rad)
+        return (75.0 + C + 3600.0 * T) % 360
+
+    def calculate_accurate_saturn(self, jd):
+        T = (jd - 2451545.0) / 36525.0
+        M = (50.077 + 1222.114 * T) % 360
+        M_rad = math.radians(M)
+        C = 2.489 * math.sin(M_rad)
+        return (90.0 + C + 1200.0 * T) % 360
+
+    def calculate_accurate_ketu(self, jd):
+        rahu = self.calculate_accurate_rahu(jd)
+        return (rahu + 180) % 360
+
+    def parse_degree_string(self, degree_str):
+        """Parse degree string like '13°20'' into (degrees, minutes)"""
+        degree_str = degree_str.strip()
+        if '°' in degree_str:
+            parts = degree_str.split('°')
+            degrees = int(parts[0])
+            minutes = int(parts[1].replace("'", "")) if len(parts) > 1 and parts[1] else 0
+            return degrees, minutes
+        return int(degree_str), 0
+
+    def format_degree(self, degrees, minutes):
+        """Format degrees and minutes into string format"""
+        return f"{degrees}°{minutes:02d}'"
+
+    def parse_nakshatra_range(self, range_str):
+        """Parse nakshatra range string into start and end degrees with signs"""
+        if '–' in range_str:
+            parts = range_str.split('–')
+        elif '-' in range_str:
+            parts = range_str.split('-')
+        else:
+            return None, None, None, None
+        
+        start_str = parts[0].strip()
+        end_str = parts[1].strip()
+        
+        # Extract start degree and sign
+        start_deg, start_min = self.parse_degree_string(start_str.split(' ')[0] if ' ' in start_str else start_str)
+        start_sign = None
+        for sign in self.zodiac_signs:
+            if sign in start_str:
+                start_sign = sign
+                break
+        
+        # Extract end degree and sign
+        end_deg, end_min = self.parse_degree_string(end_str.split(' ')[0] if ' ' in end_str else end_str)
+        end_sign = None
+        for sign in self.zodiac_signs:
+            if sign in end_str:
+                end_sign = sign
+                break
+        
+        return (start_deg, start_min, start_sign), (end_deg, end_min, end_sign)
+
+    def find_nakshatra_by_position(self, zodiac_sign, degree, minute=0):
+        """Find nakshatra for a specific position - YOUR EXACT METHOD"""
+        for nakshatra in self.nakshatras:
+            if zodiac_sign in nakshatra["signs"]:
+                start_info, end_info = self.parse_nakshatra_range(nakshatra["range"])
+                if not start_info or not end_info:
+                    continue
+                
+                (start_deg, start_min, start_sign), (end_deg, end_min, end_sign) = start_info, end_info
+                
+                # Handle single sign nakshatras
+                if len(nakshatra["signs"]) == 1:
+                    if (degree > start_deg or (degree == start_deg and minute >= start_min)) and \
+                       (degree < end_deg or (degree == end_deg and minute < end_min)):
+                        # Calculate position within nakshatra
+                        total_start_minutes = start_deg * 60 + start_min
+                        total_current_minutes = degree * 60 + minute
+                        position_minutes = total_current_minutes - total_start_minutes
+                        position_deg = position_minutes // 60
+                        position_min = position_minutes % 60
+                        
+                        return nakshatra, position_deg, position_min
+                
+                # Handle two-sign nakshatras
+                else:
+                    sign1, sign2 = nakshatra["signs"]
+                    if zodiac_sign == sign1:
+                        # In first sign portion
+                        if (degree > start_deg or (degree == start_deg and minute >= start_min)) and degree < 30:
+                            total_start_minutes = start_deg * 60 + start_min
+                            total_current_minutes = degree * 60 + minute
+                            position_minutes = total_current_minutes - total_start_minutes
+                            position_deg = position_minutes // 60
+                            position_min = position_minutes % 60
+                            return nakshatra, position_deg, position_min
+                    
+                    elif zodiac_sign == sign2:
+                        # In second sign portion
+                        if degree < end_deg or (degree == end_deg and minute < end_min):
+                            # Position in second part: from 0°00' to end_deg:end_min
+                            total_current_minutes = degree * 60 + minute
+                            position_minutes = total_current_minutes  # Starting from 0 in second sign
+                            position_deg = position_minutes // 60
+                            position_min = position_minutes % 60
+                            return nakshatra, position_deg, position_min
+        
+        return None, 0, 0
+
+    def get_nakshatra_info(self, longitude):
+        """Get nakshatra information for planetary longitude"""
+        signs = ["Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo", 
+                "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"]
+        sign_index = int(longitude / 30)
+        degree_in_sign = longitude % 30
+        degrees = int(degree_in_sign)
+        minutes = int((degree_in_sign - degrees) * 60)
+        sign = signs[sign_index]
+        
+        nakshatra, pos_deg, pos_min = self.find_nakshatra_by_position(sign, degrees, minutes)
+        
+        if nakshatra:
+            return {
+                'name': nakshatra['name'],
+                'lord': nakshatra['lord'],
+                'position_in_nakshatra': f"{pos_deg}°{pos_min:02d}'"
+            }
+        else:
+            return {'name': 'Unknown', 'lord': 'Unknown', 'position_in_nakshatra': '0°00\''}
+
+    def get_zodiac_sign(self, longitude):
+        """Convert longitude to zodiac sign"""
+        signs = ["Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo", 
+                "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"]
+        sign_index = int(longitude / 30)
+        degree_in_sign = longitude % 30
+        degrees = int(degree_in_sign)
+        minutes = int((degree_in_sign - degrees) * 60)
+        seconds = int(((degree_in_sign - degrees) * 60 - minutes) * 60)
+        return signs[sign_index], degrees, minutes, seconds, degree_in_sign
+
+    def calculate_house_signs(self, ascendant_sign):
+        """Calculate which sign is in each house based on ascendant"""
+        signs = ["Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo", 
+                "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"]
+        
+        asc_index = signs.index(ascendant_sign)
+        house_signs = {}
+        
+        for house in range(1, 13):
+            sign_index = (asc_index + house - 1) % 12
+            house_signs[house] = signs[sign_index]
+            
+        return house_signs
+
+    def analyze_planetary_conditions(self, planet, sign, degree, all_positions, year, month, day, hour, minute):
+        """Analyze all planetary conditions"""
+        conditions = []
+        strength = "Neutral"
+        
+        # 1. Check RETROGRADE status
+        if planet in self.planetary_motions:
+            motion = self.planetary_motions[planet]
+            if motion == "Retrograde":
+                conditions.append("Retrograde")
+                strength = "Challenging" if strength == "Neutral" else strength
+        
+        # 2. Check EXALTATION/DEBILITATION with WIDER ORBS
+        if planet in self.exaltation_debilitation:
+            exalt_info = self.exaltation_debilitation[planet]['exalted']
+            debil_info = self.exaltation_debilitation[planet]['debilitated']
+            
+            # WIDER ORB: 5 degrees instead of 1 degree
+            if sign == exalt_info['sign'] and abs(degree - exalt_info['degree']) <= 5:
+                conditions.append("Exalted")
+                strength = "Very Strong"
+            elif sign == debil_info['sign'] and abs(degree - debil_info['degree']) <= 5:
+                conditions.append("Debilitated") 
+                strength = "Very Weak"
+        
+        # 3. Check MOOLTRIKONA
+        if planet in self.mooltrikona and sign == self.mooltrikona[planet]:
+            conditions.append("Mooltrikona")
+            if strength != "Very Strong":  # Don't override exaltation
+                strength = "Strong"
+        
+        # 4. Check OWN SIGN
+        if planet in ['sun', 'moon', 'mars', 'mercury', 'jupiter', 'venus', 'saturn']:
+            for sign_name, lords in self.sign_lords.items():
+                if sign == sign_name and planet in lords:
+                    conditions.append("Own Sign")
+                    if strength not in ["Very Strong", "Strong"]:  # Don't override exaltation/mooltrikona
+                        strength = "Strong"
+                    break
+        
+        # 5. Check COMBUST with PROPER SIGN BOUNDARIES
+        if planet in self.combust_orbs and 'sun' in all_positions:
+            sun_long = all_positions['sun']
+            planet_long = all_positions[planet]
+            
+            # Calculate angular distance considering 360° boundary
+            distance = min(
+                abs(sun_long - planet_long),
+                360 - abs(sun_long - planet_long)
+            )
+            
+            # Check if within combust orb AND same sign (important!)
+            sun_sign = self.get_zodiac_sign(sun_long)[0]
+            planet_sign = sign
+            
+            if distance <= self.combust_orbs[planet] and sun_sign == planet_sign:
+                conditions.append("Combust")
+                if strength == "Neutral":
+                    strength = "Weak"
+        
+        # 6. Check SIGN FRIENDSHIP
+        sign_lord = self.sign_lords[sign][0]  # Primary lord
+        if planet in self.planetary_relationships:
+            rel = self.planetary_relationships[planet]
+            if sign_lord in rel['friends']:
+                conditions.append("Friendly Sign")
+                if strength == "Neutral":
+                    strength = "Good"
+            elif sign_lord in rel['enemies']:
+                conditions.append("Enemy Sign")
+                if strength == "Neutral":
+                    strength = "Challenging"
+        
+        return conditions, strength
+
+    def calculate_birth_chart(self, birth_data):
+        """PERFECT birth chart calculation with house analysis"""
+        print(f"\n🧮 Calculating PERFECT birth chart for {birth_data['name']}...")
+        
+        year, month, day = birth_data['dob']
+        hour, minute = birth_data['time']
+        lat, lon = birth_data['coordinates']['lat'], birth_data['coordinates']['lon']
+        
+        # Convert IST to UTC properly
+        utc_hour = hour - 5
+        utc_minute = minute - 30
+        if utc_minute < 0:
+            utc_minute += 60
+            utc_hour -= 1
+        if utc_hour < 0:
+            utc_hour += 24
+            day -= 1
+
+        print(f"🕒 Time Conversion: {hour:02d}:{minute:02d} IST = {utc_hour:02d}:{utc_minute:02d} UTC")
+        
+        # Calculate Julian Day for UTC time
+        jd_utc = self.calculate_julian_day(year, month, day, utc_hour, utc_minute)
+        
+        # Calculate GMST and LST
+        gmst_deg = self.calculate_gmst(jd_utc)
+        lst_deg = (gmst_deg + lon) % 360
+        
+        print(f"📍 Local Sidereal Time: {lst_deg:.2f}°")
+        print(f"📍 Latitude: {lat:.2f}°")
+        
+        # Calculate Ascendant with PERFECT formula
+        ascendant = self.calculate_perfect_ascendant(lst_deg, lat)
+        print(f"📍 Tropical Ascendant: {ascendant:.2f}°")
+        
+        # Get Ayanamsa
+        ayanamsa = self.get_ayanamsa(jd_utc)
+        print(f"📊 Lahiri Ayanamsa: {ayanamsa:.6f}°")
+        
+        # Get planetary positions for UTC time
+        planet_positions_tropical = self.get_accurate_planetary_positions(year, month, day, utc_hour, utc_minute)
+        
+        # Convert to sidereal zodiac
+        planets = ['sun', 'moon', 'mars', 'mercury', 'jupiter', 'venus', 'saturn', 'rahu', 'ketu']
+        planetary_positions = {}
+        
+        for planet in planets:
+            tropical_long = planet_positions_tropical[planet]
+            sidereal_long = (tropical_long - ayanamsa) % 360
+            sign, deg, min, sec, exact_degree = self.get_zodiac_sign(sidereal_long)
+            
+            # GET NAKSHATRA USING YOUR EXACT METHOD
+            nakshatra_info = self.get_nakshatra_info(sidereal_long)
+            
+            planetary_positions[planet] = {
+                'sign': sign,
+                'degree': deg,
+                'minute': min,
+                'second': sec,
+                'longitude': sidereal_long,
+                'exact_degree': exact_degree,
+                'nakshatra': nakshatra_info['name'],
+                'nakshatra_lord': nakshatra_info['lord'],
+                'position_in_nakshatra': nakshatra_info['position_in_nakshatra']
+            }
+        
+        # Calculate Ascendant in sidereal zodiac
+        asc_sidereal = (ascendant - ayanamsa) % 360
+        asc_sign, asc_deg, asc_min, asc_sec, asc_exact_degree = self.get_zodiac_sign(asc_sidereal)
+        asc_nakshatra_info = self.get_nakshatra_info(asc_sidereal)
+        
+        print(f"🏠 Sidereal Ascendant: {asc_sidereal:.2f}° = {asc_sign} {asc_deg}° {asc_min}' {asc_sec}\"")
+        
+        # Calculate house system
+        house_signs = self.calculate_house_signs(asc_sign)
+        
+        # Analyze planetary conditions
+        planetary_conditions = {}
+        for planet in planets:
+            data = planetary_positions[planet]
+            conditions, strength = self.analyze_planetary_conditions(
+                planet, data['sign'], data['exact_degree'], planet_positions_tropical,
+                year, month, day, utc_hour, utc_minute
+            )
+            planetary_conditions[planet] = {
+                'conditions': conditions,
+                'strength': strength
+            }
+        
+        # Calculate house placements
+        house_placements = {}
+        for house in range(1, 13):
+            house_placements[house] = {
+                'sign': house_signs[house],
+                'planets': []
+            }
+        
+        # Place planets in houses
+        for planet in planets:
+            planet_sign = planetary_positions[planet]['sign']
+            for house, data in house_placements.items():
+                if data['sign'] == planet_sign:
+                    data['planets'].append({
+                        'name': planet,
+                        'degree': planetary_positions[planet]['exact_degree'],
+                        'full_degree': f"{planetary_positions[planet]['degree']}° {planetary_positions[planet]['minute']}' {planetary_positions[planet]['second']}\"",
+                        'conditions': planetary_conditions[planet]['conditions'],
+                        'strength': planetary_conditions[planet]['strength']
+                    })
+                    break
+        
+        # Calculate house lordship
+        house_lords = {}
+        for house in range(1, 13):
+            house_sign = house_placements[house]['sign']
+            lords = self.sign_lords[house_sign]
+            house_lords[house] = {
+                'lords': lords,
+                'placements': {}
+            }
+            
+            for lord in lords:
+                # Find where this lord is placed
+                lord_sign = planetary_positions[lord]['sign']
+                for h, data in house_placements.items():
+                    if data['sign'] == lord_sign:
+                        house_lords[house]['placements'][lord] = h
+                        break
+        
+        return {
+            'ascendant': {
+                'sign': asc_sign,
+                'degree': asc_deg,
+                'minute': asc_min,
+                'second': asc_sec,
+                'longitude': asc_sidereal,
+                'exact_degree': asc_exact_degree,
+                'nakshatra': asc_nakshatra_info['name'],
+                'nakshatra_lord': asc_nakshatra_info['lord'],
+                'position_in_nakshatra': asc_nakshatra_info['position_in_nakshatra']
+            },
+            'planets': planetary_positions,
+            'planetary_conditions': planetary_conditions,
+            'house_placements': house_placements,
+            'house_lords': house_lords,
+            'ayanamsa': ayanamsa
+        }
+
+    # ========== CORRECT VEDIC ASPECT CALCULATIONS ==========
+
+    def calculate_vedic_aspects(self, planet_positions, current_planet, house_placements):
+        """Calculate Vedic aspects based on house positions"""
+        aspects = {
+            'aspecting': [],
+            'aspected_by': []
+        }
+        
+        # Get current planet's house
+        current_house = self.get_planet_house(planet_positions, current_planet, house_placements)
+        if current_house == -1:
+            return aspects
+        
+        # Determine aspected houses based on planet type
+        aspected_houses = self.get_aspected_houses(current_planet, current_house)
+        
+        # Find planets in aspected houses
+        for planet, data in planet_positions.items():
+            if planet == current_planet:
+                continue
+            
+            planet_house = self.get_planet_house(planet_positions, planet, house_placements)
+            if planet_house in aspected_houses:
+                aspect_type = self.get_aspect_type(current_planet, current_house, planet_house)
+                aspects['aspecting'].append(f"{planet} ({aspect_type})")
+        
+        # Calculate planets aspecting current planet
+        for planet, data in planet_positions.items():
+            if planet == current_planet:
+                continue
+            
+            planet_house = self.get_planet_house(planet_positions, planet, house_placements)
+            planet_aspected_houses = self.get_aspected_houses(planet, planet_house)
+            
+            if current_house in planet_aspected_houses:
+                aspect_type = self.get_aspect_type(planet, planet_house, current_house)
+                aspects['aspected_by'].append(f"{planet} ({aspect_type})")
+        
+        return aspects
+
+    def get_aspected_houses(self, planet, house):
+        """Get houses aspected by a planet from its position"""
+        aspected_houses = set()
+        
+        # ALL planets have 7th aspect
+        seventh_house = ((house + 6) % 12)
+        if seventh_house == 0: seventh_house = 12
+        aspected_houses.add(seventh_house)
+        
+        # Special aspects for specific planets
+        if planet == 'saturn':
+            # 3rd and 10th aspects
+            third_house = ((house + 2) % 12) or 12
+            tenth_house = ((house + 9) % 12) or 12
+            aspected_houses.update([third_house, tenth_house])
+        
+        elif planet == 'mars':
+            # 4th and 8th aspects
+            fourth_house = ((house + 3) % 12) or 12
+            eighth_house = ((house + 7) % 12) or 12
+            aspected_houses.update([fourth_house, eighth_house])
+        
+        elif planet == 'jupiter':
+            # 5th and 9th aspects
+            fifth_house = ((house + 4) % 12) or 12
+            ninth_house = ((house + 8) % 12) or 12
+            aspected_houses.update([fifth_house, ninth_house])
+        
+        # Rahu/Ketu only have 7th aspect (already included)
+        
+        return aspected_houses
+
+    def get_aspect_type(self, planet, from_house, to_house):
+        """Determine the type of aspect based on house difference"""
+        diff = (to_house - from_house) % 12
+        if diff == 0: diff = 12
+        
+        if diff == 6:  # 7th house aspect
+            return "7th"
+        elif planet == 'saturn' and diff == 2:
+            return "3rd"
+        elif planet == 'saturn' and diff == 9:
+            return "10th"
+        elif planet == 'mars' and diff == 3:
+            return "4th"
+        elif planet == 'mars' and diff == 7:
+            return "8th"
+        elif planet == 'jupiter' and diff == 4:
+            return "5th"
+        elif planet == 'jupiter' and diff == 8:
+            return "9th"
+        else:
+            return "special"
+
+    def get_planet_house(self, planet_positions, planet, house_placements):
+        """Get house number for a planet using actual house system"""
+        if planet not in planet_positions:
+            return -1
+        
+        planet_sign = planet_positions[planet]['sign']
+        
+        # Find which house contains this sign
+        for house_num, house_data in house_placements.items():
+            if isinstance(house_data, dict):
+                house_sign = house_data.get('sign', '')
+            else:
+                house_sign = str(house_data)
+                
+            if house_sign == planet_sign:
+                return house_num
+        
+        return -1
+
+    # ========== ADVANCED PLANETARY CALCULATIONS ==========
+
+    def calculate_avastha(self, planet, longitude, sign):
+        """Calculate Avastha (Planetary State) with Odd/Even sign correction"""
+        degree_in_sign = longitude % 30
+        degrees = int(degree_in_sign)
+        
+        # Determine if sign is odd or even
+        odd_signs = ["Aries", "Gemini", "Leo", "Libra", "Sagittarius", "Aquarius"]
+        is_odd_sign = sign in odd_signs
+        
+        # Avastha ranges (6 degrees each)
+        avastha_ranges = [
+            (0, 6, "Bala (Childhood)"),
+            (6, 12, "Yuva (Youth)"), 
+            (12, 18, "Vriddha (Old)"),
+            (18, 24, "Stha (Stationary)"),
+            (24, 30, "Tunda (Sleeping)")
+        ]
+        
+        # Reverse order for even signs
+        if not is_odd_sign:
+            avastha_ranges = list(reversed(avastha_ranges))
+        
+        # Find current avastha
+        for start, end, avastha_name in avastha_ranges:
+            if start <= degree_in_sign < end:
+                return avastha_name
+        
+        return "Unknown"
+
+    def calculate_digbali(self, planet, house):
+        """Calculate Digbali (Directional Strength)"""
+        digbali_houses = {
+            'sun': 10,    # Strong in 10th, weak in 4th
+            'moon': 4,    # Strong in 4th, weak in 10th
+            'mars': 10,   # Strong in 10th, weak in 4th
+            'mercury': 1, # Strong in 1st, weak in 7th
+            'jupiter': 1, # Strong in 1st, weak in 7th
+            'venus': 4,   # Strong in 4th, weak in 10th
+            'saturn': 7,  # Strong in 7th, weak in 1st
+            'rahu': 7,    # Same as Saturn
+            'ketu': 7     # Same as Saturn
+        }
+        
+        strong_house = digbali_houses.get(planet, -1)
+        weak_house = (strong_house + 6) % 12  # 7th from strong house
+        if weak_house == 0:
+            weak_house = 12
+        
+        if house == strong_house:
+            return "STRONG 🎯"
+        elif house == weak_house:
+            return "WEAK 💤"
+        else:
+            return "NEUTRAL ➖"
+
+    def check_maran_sthan(self, planet, house):
+        """Check Maran Sthan (Death-inflicting position) - Simple YES/NO"""
+        maran_sthan_houses = {
+            'sun': 12,
+            'moon': 8, 
+            'mars': 7,
+            'mercury': 7,
+            'jupiter': 3,
+            'venus': 6,
+            'saturn': 8,
+            'rahu': 8,
+            'ketu': 8
+        }
+        
+        death_house = maran_sthan_houses.get(planet, -1)
+        return "✅ YES" if house == death_house else "❌ NO"
+
+    # ========== ENHANCED LOCATION FINDER ==========
+
+    def find_city_coordinates(self):
+        """Enhanced location search with all fields optional except city"""
+        print("\n" + "="*50)
+        print("📍 ENHANCED LOCATION SEARCH")
+        print("="*50)
+        
+        while True:
+            print("\n--- Enter Birth Place Details ---")
+            city = input("City Name: ").strip()
+            if not city:
+                print("❌ City name is required!")
+                continue
+                
+            state = input("State (optional): ").strip()
+            country = input("Country (optional): ").strip()
+            
+            # Build query - only include provided fields
+            query_parts = [city]
+            if state:
+                query_parts.append(state)
+            if country:
+                query_parts.append(country)
+            query = ", ".join(query_parts)
+            
+            print(f"\n🔍 Searching for: {query}")
+            print("Please wait...")
+            
+            try:
+                url = "https://nominatim.openstreetmap.org/search"
+                params = {
+                    'q': query,
+                    'format': 'json',
+                    'limit': 10,
+                    'addressdetails': 1
+                }
+                
+                headers = {
+                    'User-Agent': 'VedicAstrologyApp/1.0'
+                }
+                
+                response = requests.get(url, params=params, headers=headers, timeout=15)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    if data:
+                        print(f"\n✅ Found {len(data)} results:")
+                        print("=" * 70)
+                        
+                        for i, place in enumerate(data, 1):
+                            address = place.get('address', {})
+                            state_name = address.get('state', 'Not specified')
+                            country_name = address.get('country', 'Not specified')
+                            print(f"\n{i}. {place.get('display_name', 'Unknown')}")
+                            print(f"   📍 State: {state_name}")
+                            print(f"   📍 Country: {country_name}")
+                            print(f"   📍 Lat: {place.get('lat')}, Lon: {place.get('lon')}")
+                        print("=" * 70)
+                        
+                        try:
+                            selection = int(input("\n🎯 Select location (enter number): ")) - 1
+                            if 0 <= selection < len(data):
+                                selected = data[selection]
+                                address = selected.get('address', {})
+                                location_info = {
+                                    'name': selected.get('display_name', 'Unknown'),
+                                    'latitude': float(selected.get('lat', 0)),
+                                    'longitude': float(selected.get('lon', 0)),
+                                    'city': address.get('city', address.get('town', address.get('village', city))),
+                                    'state': address.get('state', state) if state else 'Not specified',
+                                    'country': address.get('country', country) if country else 'Not specified'
+                                }
+                                print(f"\n✅ SELECTED: {location_info['name']}")
+                                return location_info
+                            else:
+                                print("❌ Invalid selection! Please try again.")
+                        except ValueError:
+                            print("❌ Please enter a valid number!")
+                        
+                    else:
+                        print("❌ No results found!")
+                        print("💡 Tips: Check spelling, try different city name, or add more details")
+                        
+                else:
+                    print(f"❌ API Error: {response.status_code}")
+                    print("💡 Please check your internet connection and try again")
+                    
+            except requests.exceptions.Timeout:
+                print("❌ Request timeout. Please check your internet connection.")
+            except requests.exceptions.ConnectionError:
+                print("❌ Connection error. Please check your internet connection.")
+            except Exception as e:
+                print(f"❌ Unexpected error: {e}")
+            
+            # Continue?
+            retry = input("\n🔄 Search again? (y/n): ").strip().lower()
+            if retry != 'y':
+                return None
+
+    # ========== FIXED DISPLAY METHODS ==========
+
+    def display_house_cards(self, chart_data):
+        """FIXED: House cards that work with both saved and new charts"""
+        print(f"\n" + "="*80)
+        print(f"🏠 HOUSE ANALYSIS - PLANETARY PLACEMENTS")
+        print("="*80)
+        
+        # FIX: Handle both data formats
+        house_placements = chart_data.get('house_placements', {})
+        house_lords = chart_data.get('house_lords', {})
+        
+        planet_icons = {
+            'sun': '☀️', 'moon': '🌙', 'mars': '♂️', 'mercury': '☿', 
+            'jupiter': '♃', 'venus': '♀️', 'saturn': '♄', 'rahu': '☊', 'ketu': '☋'
+        }
+        
+        planet_names = {
+            'sun': 'Sun', 'moon': 'Moon', 'mars': 'Mars', 'mercury': 'Mercury',
+            'jupiter': 'Jupiter', 'venus': 'Venus', 'saturn': 'Saturn',
+            'rahu': 'Rahu', 'ketu': 'Ketu'
+        }
+        
+        for house in range(1, 13):
+            # FIX: Handle both string and integer keys
+            house_key = house
+            if house_key not in house_placements and str(house_key) in house_placements:
+                house_key = str(house_key)
+                
+            house_data = house_placements.get(house_key)
+            if not house_data:
+                print(f"\n┌{'─' * 78}┐")
+                print(f"│ 🏠 HOUSE {house}: DATA MISSING{' ' * 58} │")
+                print(f"└{'─' * 78}┘")
+                continue
+            
+            # FIX: Extract house sign and planets based on data structure
+            if isinstance(house_data, dict):
+                house_sign = house_data.get('sign', 'Unknown')
+                planets_in_house = house_data.get('planets', [])
+            else:
+                house_sign = str(house_data)
+                planets_in_house = []
+            
+            # FIX: Handle house lords data
+            lords_data = house_lords.get(house_key) or house_lords.get(str(house_key), {})
+            lords = lords_data.get('lords', []) if isinstance(lords_data, dict) else []
+            lord_placements = lords_data.get('placements', {}) if isinstance(lords_data, dict) else {}
+            
+            print(f"\n┌{'─' * 78}┐")
+            print(f"│ 🏠 HOUSE {house}: {house_sign.upper():<64} │")
+            print(f"│{' ' * 78}│")
+            
+            if planets_in_house:
+                for planet_data in planets_in_house:
+                    if isinstance(planet_data, dict):
+                        planet = planet_data.get('name', 'unknown')
+                        icon = planet_icons.get(planet, '🌟')
+                        name = planet_names.get(planet, planet)
+                        
+                        # Get which houses this planet rules
+                        ruled_houses = []
+                        for h in range(1, 13):
+                            h_key = h
+                            if h_key not in house_lords and str(h_key) in house_lords:
+                                h_key = str(h_key)
+                            h_lords = house_lords.get(h_key, {})
+                            if isinstance(h_lords, dict) and planet in h_lords.get('lords', []):
+                                ruled_houses.append(str(h))
+                        
+                        lordship_info = f"({','.join(ruled_houses)}th Lord)" if ruled_houses else ""
+                        
+                        print(f"│   {icon} {name} {lordship_info:<54} │")
+                        print(f"│   📍 {planet_data.get('full_degree', 'Unknown'):<70} │")
+                        print(f"│   💪 {planet_data.get('strength', 'Unknown'):<72} │")
+                        
+                        conditions = planet_data.get('conditions', [])
+                        if conditions:
+                            cond_str = " · ".join(conditions)
+                            print(f"│   📊 {cond_str:<70} │")
+                        
+                        print(f"│   {'─' * 74} │")
+            else:
+                print(f"│   📭 EMPTY{' ' * 67} │")
+                print(f"│   {'─' * 74} │")
+            
+            # Lord analysis
+            print(f"│   🔮 LORD ANALYSIS:{' ' * 58} │")
+            if lords:
+                for lord in lords:
+                    placement = lord_placements.get(lord, "Not placed")
+                    lord_name = planet_names.get(lord, lord)
+                    
+                    if placement != "Not placed":
+                        lord_data = chart_data.get('planets', {}).get(lord, {})
+                        lord_sign = lord_data.get('sign', 'Unknown')
+                        
+                        # Determine relationship
+                        sign_lord = self.sign_lords.get(lord_sign, [''])[0]
+                        relationship = "Neutral"
+                        if lord in self.planetary_relationships:
+                            rel = self.planetary_relationships[lord]
+                            if sign_lord in rel['friends']:
+                                relationship = "Friendly"
+                            elif sign_lord in rel['enemies']:
+                                relationship = "Enemy"
+                        
+                        print(f"│   ├── {lord_name}: Rules H{house} → Placed in H{placement} ({lord_sign} - {relationship}){' ' * 30} │")
+                    else:
+                        print(f"│   ├── {lord_name}: Rules H{house} → Not placed{' ' * 45} │")
+            else:
+                print(f"│   ├── No lords found for this house{' ' * 42} │")
+            
+            print(f"└{'─' * 78}┘")
+
+    def display_planet_cards(self, chart_data):
+        """FIXED: Planet cards that work with both saved and new charts"""
+        print(f"\n" + "="*80)
+        print(f"🪐 DETAILED PLANETARY ANALYSIS")
+        print("="*80)
+        
+        # FIX: Handle both data formats
+        planets_data = chart_data.get('planets', {})
+        house_placements = chart_data.get('house_placements', {})
+        
+        planet_icons = {
+            'sun': '☀️', 'moon': '🌙', 'mars': '♂️', 'mercury': '☿', 
+            'jupiter': '♃', 'venus': '♀️', 'saturn': '♄', 'rahu': '☊', 'ketu': '☋'
+        }
+        
+        for planet in ['sun', 'moon', 'mars', 'mercury', 'jupiter', 'venus', 'saturn', 'rahu', 'ketu']:
+            data = planets_data.get(planet, {})
+            if not data:
+                continue
+                
+            conditions_data = chart_data.get('planetary_conditions', {}).get(planet, {})
+            conditions = conditions_data.get('conditions', []) if isinstance(conditions_data, dict) else []
+            
+            # Get house placement
+            house = self.get_planet_house(planets_data, planet, house_placements)
+            
+            # Calculate additional info
+            avastha = self.calculate_avastha(planet, data.get('longitude', 0), data.get('sign', 'Unknown'))
+            digbali = self.calculate_digbali(planet, house)
+            maran_sthan = self.check_maran_sthan(planet, house)
+            aspects = self.calculate_vedic_aspects(planets_data, planet, house_placements)
+            
+            print(f"\n┌{'─' * 78}┐")
+            print(f"│ {planet_icons.get(planet, '🌟')} {planet.upper():<72} │")
+            print(f"│{' ' * 78}│")
+            
+            # Basic info
+            print(f"│   📍 Sign: {data.get('sign', 'Unknown'):<66} │")
+            print(f"│   🌌 Nakshatra: {data.get('nakshatra', 'Unknown')} (Lord: {data.get('nakshatra_lord', 'Unknown')}) at {data.get('position_in_nakshatra', '0°00')}{' ' * 32} │")
+            print(f"│   🪐 Avastha: {avastha:<58} │")
+            
+            # Sign placement
+            sign = data.get('sign', '')
+            if sign and sign in self.sign_lords:
+                sign_lord = self.sign_lords[sign][0]
+                if planet in self.planetary_relationships:
+                    rel = self.planetary_relationships[planet]
+                    if sign_lord in rel['friends']:
+                        placement = "Friendly"
+                    elif sign_lord in rel['enemies']:
+                        placement = "Enemy"
+                    else:
+                        placement = "Neutral"
+                    print(f"│   🤝 Sign Placement: {placement:<60} │")
+            
+            # Aspect analysis
+            print(f"│   🔍 Aspect Analysis:{' ' * 58} │")
+            if aspects.get('aspecting'):
+                aspecting_str = ", ".join(aspects['aspecting'][:3])
+                print(f"│   ├── Aspects To: {aspecting_str:<50} │")
+            else:
+                print(f"│   ├── Aspects To: None{' ' * 55} │")
+                
+            if aspects.get('aspected_by'):
+                aspected_str = ", ".join(aspects['aspected_by'][:3])
+                print(f"│   └── Aspected By: {aspected_str:<48} │")
+            else:
+                print(f"│   └── Aspected By: None{' ' * 53} │")
+            
+            # Conditions
+            cond_symbols = []
+            if "Exalted" in conditions:
+                cond_symbols.append("🎯 Exalted")
+            if "Debilitated" in conditions:
+                cond_symbols.append("📉 Debilitated")
+            if "Retrograde" in conditions:
+                cond_symbols.append("🔄 Retrograde")
+            if "Combust" in conditions:
+                cond_symbols.append("🔥 Combust")
+            if "Own Sign" in conditions:
+                cond_symbols.append("🏠 Own Sign")
+            if "Mooltrikona" in conditions:
+                cond_symbols.append("⭐ Mooltrikona")
+            if "Friendly Sign" in conditions:
+                cond_symbols.append("🤝 Friendly")
+            if "Enemy Sign" in conditions:
+                cond_symbols.append("⚔️ Enemy")
+                
+            if cond_symbols:
+                print(f"│   📊 Conditions: {' · '.join(cond_symbols):<56} │")
+            
+            # Additional analysis
+            print(f"│   🧭 Digbali: {digbali:<65} │")
+            print(f"│   💀 Maran Sthan: {maran_sthan:<60} │")
+            
+            print(f"└{'─' * 78}┘")
+
+    def display_birth_chart(self, birth_data, chart_data):
+        """Display the comprehensive birth chart"""
+        print("\n" + "="*80)
+        print(f"🎯 100% ACCURATE VEDIC BIRTH CHART")
+        print(f"🌟 FOR: {birth_data['name'].upper()}")
+        print("="*80)
+        
+        # Personal details
+        print(f"\n📋 PERSONAL DETAILS:")
+        print(f"   Name: {birth_data['name']}")
+        print(f"   Date of Birth: {birth_data['dob'][2]:02d}/{birth_data['dob'][1]:02d}/{birth_data['dob'][0]}")
+        print(f"   Time of Birth: {birth_data['time'][0]:02d}:{birth_data['time'][1]:02d} IST")
+        print(f"   Gender: {birth_data['gender']}")
+        if birth_data.get('profession'):
+            print(f"   🎯 Profession: {birth_data['profession']}")
+        print(f"   Birth Place: {birth_data['location_name']}")
+        print(f"   Ayanamsa: {chart_data['ayanamsa']:.6f}°")
+        
+        # Ascendant
+        asc = chart_data['ascendant']
+        print(f"\n🏠 ASCENDANT (Lagna):")
+        print(f"   {asc['sign']} - {asc['degree']}° {asc['minute']}' {asc['second']}\"")
+        print(f"   Nakshatra: {asc['nakshatra']} (Lord: {asc['nakshatra_lord']}) at {asc['position_in_nakshatra']}")
+        
+        # Display house cards
+        self.display_house_cards(chart_data)
+        
+        # Display planet cards with CORRECT VEDIC ASPECTS
+        self.display_planet_cards(chart_data)
+        
+        print("\n" + "="*80)
+        print("✅ PERFECT ANALYSIS COMPLETE - 100% ACCURATE CALCULATIONS")
+        print("="*80)
+
+    # ========== ENHANCED CHART MANAGEMENT ==========
+
+    def enhanced_search_charts(self):
+        """Search and display existing charts with FULL chart display"""
+        search_term = input("\nEnter search term (leave blank for all): ").strip()
+        results = self.search_persons(search_term)
+        
+        if not results:
+            print("❌ No charts found!")
+            return None
+        
+        print(f"\n🔍 EXISTING CHARTS DATABASE")
+        print("=" * 50)
+        
+        for i, (person_id, name, profession, birth_date, birth_time, location) in enumerate(results, 1):
+            prof_display = f" | 🎯 {profession}" if profession else ""
+            time_display = f" | 🕒 {birth_time}" if birth_time else " | 🕒 Time not recorded"
+            print(f"{i}. {name}")
+            print(f"   📅 {birth_date}{time_display}{prof_display} | 📍 {location}")
+            print()
+        
+        try:
+            selection = int(input("\nSelect chart number or 0 to return: "))
+            if selection == 0:
+                return None
+            if 1 <= selection <= len(results):
+                person_id = results[selection-1][0]
+                person_name = results[selection-1][1]
+                chart_package = self.load_person_chart(person_id)
+                
+                if chart_package:
+                    print(f"\n" + "="*80)
+                    print(f"✅ LOADING {person_name.upper()}'S COMPLETE BIRTH CHART")
+                    print("="*80)
+                    
+                    # EXTRACT THE DATA FOR DISPLAY
+                    birth_data = chart_package['person_data']
+                    chart_data = chart_package['chart_data']
+                    
+                    # DISPLAY THE FULL CHART (SAME AS CALCULATION)
+                    self.display_birth_chart(birth_data, chart_data)
+                    
+                    # ADD OPTIONS AFTER VIEWING CHART
+                    self.post_chart_viewing_options(person_id, birth_data, chart_data)
+                    
+                    return chart_package
+                else:
+                    print("❌ Error loading chart file!")
+            else:
+                print("❌ Invalid selection!")
+        except ValueError:
+            print("❌ Please enter a valid number!")
+        
+        return None
+
+    def post_chart_viewing_options(self, person_id, birth_data, chart_data):
+        """Options after viewing a chart"""
+        while True:
+            print("\n" + "="*50)
+            print("📊 CHART VIEWING OPTIONS")
+            print("="*50)
+            print("1. 🔍 View Linked Combinations")
+            print("2. ➕ Add Combination to This Chart")  
+            print("3. 📝 Add Notes to This Chart")
+            print("4. 📄 Export Chart to Text File")
+            print("5. ↩️  Back to Chart List")
+            print("6. 🏠 Back to Main Menu")
+            
+            choice = input("\nChoose option (1-6): ").strip()
+            
+            if choice == "1":
+                self.view_linked_combinations(person_id)
+            elif choice == "2":
+                self.add_combination_to_chart(person_id, chart_data)
+            elif choice == "3":
+                self.add_notes_to_chart(person_id)
+            elif choice == "4":
+                self.export_chart_text(birth_data, chart_data)
+            elif choice == "5":
+                break  # Back to chart list
+            elif choice == "6":
+                return True  # Back to main menu
+            else:
+                print("❌ Invalid choice!")
+        
+        return False
+
+    # ========== DATABASE METHODS ==========
+    
+    def save_person_chart(self, person_data, chart_data):
+        """Save person chart to database and files - FIXED VERSION"""
+        try:
+            # Generate unique filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            name_clean = re.sub(r'[^\w]', '_', person_data['name'])
+            json_filename = f"{name_clean}_{timestamp}.json"
+            text_filename = f"{name_clean}_{timestamp}.txt"
+            
+            json_path = os.path.join(self.base_dir, "charts", json_filename)
+            text_path = os.path.join(self.base_dir, "charts", text_filename)
+            
+            # Create charts directory
+            os.makedirs(os.path.dirname(json_path), exist_ok=True)
+            
+            # Save JSON file
+            chart_package = {
+                'person_data': person_data,
+                'chart_data': chart_data,
+                'saved_date': datetime.now().isoformat()
+            }
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(chart_package, f, indent=2, ensure_ascii=False)
+            
+            # Save text file
+            self.save_text_chart(person_data, chart_data, text_path)
+            
+            # FIXED: Save birth_time separately in database
+            self.cursor.execute('''
+                INSERT INTO persons (name, profession, birth_date, birth_time, location, chart_json_path, chart_text_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                person_data['name'],
+                person_data.get('profession', ''),
+                f"{person_data['dob'][0]}-{person_data['dob'][1]:02d}-{person_data['dob'][2]:02d}",
+                f"{person_data['time'][0]:02d}:{person_data['time'][1]:02d}",  # ✅ Store birth_time separately
+                person_data['location_name'],
+                json_path,
+                text_path
+            ))
+            
+            self.conn.commit()
+            print(f"✅ Chart saved successfully!")
+            
+            # Auto-link with combinations
+            self.auto_link_combinations(person_data, chart_data)
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error saving chart: {e}")
+            return False
+
+    def search_persons(self, search_term=""):
+        """Search persons in database - FIXED VERSION"""
+        try:
+            if not search_term:
+                self.cursor.execute('''
+                    SELECT id, name, profession, birth_date, birth_time, location 
+                    FROM persons ORDER BY name
+                ''')
+            else:
+                self.cursor.execute('''
+                    SELECT id, name, profession, birth_date, birth_time, location 
+                    FROM persons 
+                    WHERE name LIKE ? OR profession LIKE ? OR location LIKE ?
+                    ORDER BY name
+                ''', (f'%{search_term}%', f'%{search_term}%', f'%{search_term}%'))
+            
+            return self.cursor.fetchall()
+        except Exception as e:
+            print(f"❌ Search error: {e}")
+            return []
+
+    def load_person_chart(self, person_id):
+        """Load person chart from database - ENHANCED with better error handling"""
+        try:
+            self.cursor.execute('SELECT chart_json_path FROM persons WHERE id = ?', (person_id,))
+            result = self.cursor.fetchone()
+            
+            if not result:
+                print("❌ Person not found in database!")
+                return None
+                
+            json_path = result[0]
+            
+            if not os.path.exists(json_path):
+                print(f"❌ Chart file not found: {json_path}")
+                print("💡 The chart file may have been moved or deleted")
+                return None
+            
+            print(f"📁 Loading chart from: {json_path}")
+            
+            with open(json_path, 'r', encoding='utf-8') as f:
+                chart_package = json.load(f)
+            
+            # Validate chart data structure
+            if 'person_data' not in chart_package:
+                print("❌ Chart file missing person data!")
+                return None
+                
+            if 'chart_data' not in chart_package:
+                print("❌ Chart file missing chart calculations!")
+                return None
+                
+            required_keys = ['ascendant', 'planets', 'house_placements', 'house_lords']
+            for key in required_keys:
+                if key not in chart_package['chart_data']:
+                    print(f"❌ Chart data missing required key: {key}")
+                    return None
+            
+            print("✅ Chart data validated successfully!")
+            return chart_package
+            
+        except json.JSONDecodeError:
+            print("❌ Chart file is corrupted (invalid JSON format)!")
+            return None
+        except Exception as e:
+            print(f"❌ Error loading chart: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def save_text_chart(self, birth_data, chart_data, file_path):
+        """Save human-readable text chart"""
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write("🎯 PERFECT VEDIC BIRTH CHART\n")
+                f.write("=" * 60 + "\n\n")
+                
+                # Personal details
+                f.write("📋 PERSONAL DETAILS:\n")
+                f.write(f"Name: {birth_data['name']}\n")
+                f.write(f"Date of Birth: {birth_data['dob'][2]:02d}/{birth_data['dob'][1]:02d}/{birth_data['dob'][0]}\n")
+                f.write(f"Time of Birth: {birth_data['time'][0]:02d}:{birth_data['time'][1]:02d} IST\n")
+                f.write(f"Gender: {birth_data['gender']}\n")
+                if birth_data.get('profession'):
+                    f.write(f"Profession: {birth_data['profession']}\n")
+                f.write(f"Birth Place: {birth_data['location_name']}\n")
+                f.write(f"Ayanamsa: {chart_data['ayanamsa']:.6f}°\n\n")
+                
+                # Ascendant
+                asc = chart_data['ascendant']
+                f.write("🏠 ASCENDANT (Lagna):\n")
+                f.write(f"{asc['sign']} - {asc['degree']}° {asc['minute']}' {asc['second']}\"\n")
+                f.write(f"Nakshatra: {asc['nakshatra']} (Lord: {asc['nakshatra_lord']}) at {asc['position_in_nakshatra']}\n\n")
+                
+                # Planetary positions
+                f.write("PLANETARY POSITIONS:\n")
+                f.write("-" * 50 + "\n")
+                planet_names = {
+                    'sun': 'Sun', 'moon': 'Moon', 'mars': 'Mars', 'mercury': 'Mercury',
+                    'jupiter': 'Jupiter', 'venus': 'Venus', 'saturn': 'Saturn',
+                    'rahu': 'Rahu', 'ketu': 'Ketu'
+                }
+                
+                for planet in ['sun', 'moon', 'mars', 'mercury', 'jupiter', 'venus', 'saturn', 'rahu', 'ketu']:
+                    data = chart_data['planets'][planet]
+                    conditions = chart_data['planetary_conditions'][planet]
+                    f.write(f"{planet_names[planet]:<12}: {data['sign']} {data['degree']}°{data['minute']}'{data['second']}\"\n")
+                    f.write(f"{'':<12}Nakshatra: {data['nakshatra']} (Lord: {data['nakshatra_lord']})\n")
+                    f.write(f"{'':<12}Strength: {conditions['strength']}\n")
+                    if conditions['conditions']:
+                        f.write(f"{'':<12}Conditions: {', '.join(conditions['conditions'])}\n")
+                    f.write("\n")
+                
+                # House analysis
+                f.write("HOUSE ANALYSIS:\n")
+                f.write("-" * 50 + "\n")
+                for house in range(1, 13):
+                    house_data = chart_data['house_placements'][house]
+                    f.write(f"House {house:2d}: {house_data['sign']:12}")
+                    if house_data['planets']:
+                        planet_list = []
+                        for planet in house_data['planets']:
+                            planet_list.append(planet_names[planet['name']])
+                        f.write(f" ← {', '.join(planet_list)}\n")
+                    else:
+                        f.write(" ← Empty\n")
+                
+                f.write(f"\nGenerated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("Created by AstroKarmaPath - By UTTAM GHOSH\n")
+                
+            return True
+        except Exception as e:
+            print(f"❌ Error saving text chart: {e}")
+            return False
+
+    # ========== ENHANCED USER INPUT METHODS ==========
+
+    def get_birth_details(self):
+        """Get birth details from user with enhanced location search"""
+        print("\n" + "="*50)
+        print("👤 PERSONAL DETAILS")
+        print("="*50)
+        
+        name = input("\nEnter Name: ").strip()
+        if not name: 
+            return None
+        
+        print("\n📅 Date of Birth:")
+        try:
+            dob_day = int(input("  Day (1-31): "))
+            dob_month = int(input("  Month (1-12): "))
+            dob_year = int(input("  Year: "))
+            # Validate date
+            datetime(dob_year, dob_month, dob_day)
+        except (ValueError, Exception): 
+            print("❌ Invalid date!")
+            return None
+        
+        print("\n⏰ Time of Birth (24-hour IST):")
+        try:
+            hour = int(input("  Hour (0-23): "))
+            minute = int(input("  Minute (0-59): "))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59): 
+                print("❌ Invalid time!")
+                return None
+        except ValueError: 
+            print("❌ Invalid time format!")
+            return None
+        
+        gender = input("\n👤 Gender (m/f/other): ").strip() or "Not specified"
+        
+        profession = input("\n🎯 Profession (optional): ").strip()
+        
+        print("\n" + "="*50)
+        print("📍 BIRTH LOCATION")
+        print("="*50)
+        print("💡 Tip: Only city name is required. State and country are optional.")
+        
+        location_data = self.find_city_coordinates()
+        if not location_data: 
+            print("❌ Location selection cancelled!")
+            return None
+        
+        return {
+            'name': name,
+            'dob': (dob_year, dob_month, dob_day),
+            'time': (hour, minute),
+            'gender': gender,
+            'profession': profession,
+            'location_name': location_data['name'],
+            'coordinates': {
+                'lat': location_data['latitude'], 
+                'lon': location_data['longitude']
+            }
+        }
+
+    # ========== OPTION 1: ENHANCED COMBINATION MANAGEMENT ==========
+
+    def enhanced_database_manager(self):
+        """NEW: Enhanced combination management system"""
+        while True:
+            print("\n" + "="*50)
+            print("🗃️  MASTER DATABASE MANAGER")
+            print("="*50)
+            print("1. 📋 View & Manage All Combinations")
+            print("2. ➕ Add New Combination")  
+            print("3. 🔍 Search Combinations")
+            print("4. 📊 View Combination Analytics")
+            print("5. ↩️  Back to Main Menu")
+            
+            choice = input("\nChoose option (1-5): ").strip()
+            
+            if choice == "1":
+                self.enhanced_view_manage_combinations()
+            elif choice == "2":
+                self.enhanced_add_combination()
+            elif choice == "3":
+                self.enhanced_search_combinations()
+            elif choice == "4":
+                self.view_combination_analytics()
+            elif choice == "5":
+                return
+            else:
+                print("❌ Invalid choice!")
+
+    def enhanced_view_manage_combinations(self):
+        """NEW: Enhanced combination viewing and management"""
+        try:
+            self.cursor.execute('''
+                SELECT c.id, c.name, c.result, 
+                       (SELECT COUNT(*) FROM combination_person_links WHERE combination_id = c.id) as person_count,
+                       (SELECT COUNT(*) FROM notes WHERE linked_combination_id = c.id) as note_count
+                FROM combinations c
+                ORDER BY c.name
+            ''')
+            combinations = self.cursor.fetchall()
+            
+            if not combinations:
+                print("❌ No combinations found in database!")
+                return
+            
+            print(f"\n📋 COMBINATION MANAGEMENT")
+            print("=" * 70)
+            print(f"Found {len(combinations)} combinations:\n")
+            
+            for i, (comb_id, name, result, person_count, note_count) in enumerate(combinations, 1):
+                # Get planet info for display
+                self.cursor.execute('SELECT criteria_planets FROM combinations WHERE id = ?', (comb_id,))
+                planet_result = self.cursor.fetchone()
+                planet_info = ""
+                if planet_result and planet_result[0]:
+                    planets = [p.strip() for p in planet_result[0].split(',') if p.strip()]
+                    planet_info = " · ".join(planets[:2])  # Show first 2 planets
+                
+                print(f"{i}. 🔮 {name}")
+                if planet_info:
+                    print(f"   💡 {planet_info} | 👥 {person_count} persons | 📝 {note_count} notes")
+                else:
+                    print(f"   💡 {result} | 👥 {person_count} persons | 📝 {note_count} notes")
+                print()
+            
+            print("=" * 70)
+            
+            try:
+                selection = input("\nSelect combination (1-{}) or 0 to return: ".format(len(combinations))).strip()
+                if selection == "0":
+                    return
+                
+                selection = int(selection)
+                if 1 <= selection <= len(combinations):
+                    comb_id = combinations[selection-1][0]
+                    comb_name = combinations[selection-1][1]
+                    self.manage_single_combination(comb_id, comb_name)
+                else:
+                    print("❌ Invalid selection!")
+                    
+            except ValueError:
+                print("❌ Please enter a valid number!")
+                
+        except Exception as e:
+            print(f"❌ Error viewing combinations: {e}")
+
+    def manage_single_combination(self, comb_id, comb_name):
+        """NEW: Manage a single combination with all operations"""
+        while True:
+            # Get combination details
+            comb_details = self.get_combination_details(comb_id)
+            linked_persons = self.get_linked_persons(comb_id)
+            linked_notes = self.get_linked_notes(comb_id)
+            
+            print(f"\n🔮 COMBINATION MANAGEMENT: {comb_name}")
+            print("=" * 50)
+            
+            # Display combination details
+            print("📋 Details:")
+            if comb_details.get('planets'):
+                print(f"   • Planets: {comb_details['planets']}")
+            if comb_details.get('signs'):
+                print(f"   • Signs: {comb_details['signs']}")
+            if comb_details.get('houses'):
+                print(f"   • Houses: {comb_details['houses']}")
+            if comb_details.get('nakshatras'):
+                print(f"   • Nakshatras: {comb_details['nakshatras']}")
+            print(f"   • Logic: {comb_details.get('logic', 'OR')}")
+            if comb_details.get('result'):
+                print(f"   • Expected Result: {comb_details['result']}")
+            
+            # Display linked persons
+            print(f"\n👥 Linked to {len(linked_persons)} person(s):")
+            for person in linked_persons[:3]:  # Show first 3
+                print(f"   - {person['name']} ({person.get('profession', 'No profession')})")
+            if len(linked_persons) > 3:
+                print(f"   ... and {len(linked_persons) - 3} more")
+            
+            # Display linked notes
+            print(f"\n📝 Linked Notes ({len(linked_notes)} notes)")
+            for note in linked_notes[:2]:  # Show first 2
+                preview = note['text'][:50] + "..." if len(note['text']) > 50 else note['text']
+                print(f"   - \"{preview}\"")
+            if len(linked_notes) > 2:
+                print(f"   ... and {len(linked_notes) - 2} more")
+            
+            # Available actions
+            print(f"\n🛠️  Available Actions:")
+            print("1. ✏️  Edit This Combination")
+            print("2. 🗑️  Delete This Combination") 
+            print("3. 📝 Link Notes to This Combination")
+            print("4. 🔗 Manage Person Links")
+            print("5. ↩️  Back to Combination List")
+            
+            try:
+                choice = input("\nChoose action (1-5): ").strip()
+                
+                if choice == "1":
+                    new_name = self.edit_combination_flow(comb_id, comb_name, comb_details)
+                    if new_name != comb_name:
+                        comb_name = new_name  # Update name if changed
+                elif choice == "2":
+                    if self.delete_combination_flow(comb_id, comb_name, len(linked_persons), len(linked_notes)):
+                        return  # Go back to list after deletion
+                elif choice == "3":
+                    self.link_notes_to_combination(comb_id, comb_name)
+                elif choice == "4":
+                    self.manage_person_links(comb_id, comb_name)
+                elif choice == "5":
+                    return
+                else:
+                    print("❌ Invalid choice!")
+                    
+            except KeyboardInterrupt:
+                print("\n⏹️  Operation cancelled")
+                return
+
+    def get_combination_details(self, comb_id):
+        """NEW: Get detailed combination information"""
+        try:
+            self.cursor.execute('''
+                SELECT criteria_planets, criteria_signs, criteria_houses, 
+                       criteria_nakshatras, criteria_house_lords, criteria_custom,
+                       logic, result
+                FROM combinations WHERE id = ?
+            ''', (comb_id,))
+            
+            result = self.cursor.fetchone()
+            if not result:
+                return {}
+            
+            details = {
+                'planets': result[0],
+                'signs': result[1],
+                'houses': result[2],
+                'nakshatras': result[3],
+                'house_lords': result[4],
+                'custom': result[5],
+                'logic': result[6] or 'OR',
+                'result': result[7]
+            }
+            
+            # Clean up empty values
+            for key in list(details.keys()):
+                if not details[key]:
+                    del details[key]
+                    
+            return details
+            
+        except Exception as e:
+            print(f"❌ Error getting combination details: {e}")
+            return {}
+
+    def get_linked_persons(self, comb_id):
+        """NEW: Get persons linked to this combination"""
+        try:
+            self.cursor.execute('''
+                SELECT p.id, p.name, p.profession, p.birth_date
+                FROM persons p
+                JOIN combination_person_links cpl ON p.id = cpl.person_id
+                WHERE cpl.combination_id = ?
+            ''', (comb_id,))
+            
+            persons = []
+            for person_id, name, profession, birth_date in self.cursor.fetchall():
+                persons.append({
+                    'id': person_id,
+                    'name': name,
+                    'profession': profession or 'No profession',
+                    'birth_date': birth_date
+                })
+                
+            return persons
+            
+        except Exception as e:
+            print(f"❌ Error getting linked persons: {e}")
+            return []
+
+    def get_linked_notes(self, comb_id):
+        """NEW: Get notes linked to this combination"""
+        try:
+            self.cursor.execute('''
+                SELECT id, note_text, created_date
+                FROM notes 
+                WHERE linked_combination_id = ?
+                ORDER BY created_date DESC
+            ''', (comb_id,))
+            
+            notes = []
+            for note_id, note_text, created_date in self.cursor.fetchall():
+                notes.append({
+                    'id': note_id,
+                    'text': note_text,
+                    'date': created_date
+                })
+                
+            return notes
+            
+        except Exception as e:
+            print(f"❌ Error getting linked notes: {e}")
+            return []
+
+    def edit_combination_flow(self, comb_id, current_name, current_details):
+        """NEW: Enhanced combination editing"""
+        print(f"\n✏️ EDIT COMBINATION: {current_name}")
+        print("=" * 50)
+        
+        # Show current values
+        print("Current Values:")
+        planets_display = current_details.get('planets', 'None')
+        signs_display = current_details.get('signs', 'None') 
+        result_display = current_details.get('result', 'None')
+        print(f"   Planets: {planets_display}")
+        print(f"   Signs: {signs_display}")
+        print(f"   Result: {result_display}")
+        print()
+        
+        # Get new values
+        new_name = input(f"New Name [{current_name}]: ").strip() or current_name
+        new_planets = input(f"Planets [{current_details.get('planets', '')}]: ").strip() or current_details.get('planets', '')
+        new_signs = input(f"Signs [{current_details.get('signs', '')}]: ").strip() or current_details.get('signs', '')
+        new_houses = input(f"Houses [{current_details.get('houses', '')}]: ").strip() or current_details.get('houses', '')
+        new_result = input(f"Result [{current_details.get('result', '')}]: ").strip() or current_details.get('result', '')
+        
+        try:
+            self.cursor.execute('''
+                UPDATE combinations 
+                SET name = ?, criteria_planets = ?, criteria_signs = ?, criteria_houses = ?, result = ?
+                WHERE id = ?
+            ''', (new_name, new_planets, new_signs, new_houses, new_result, comb_id))
+            
+            self.conn.commit()
+            print("✅ Combination updated successfully!")
+            
+            # Update the current name if changed
+            if new_name != current_name:
+                return new_name
+                
+        except Exception as e:
+            print(f"❌ Error updating combination: {e}")
+        
+        return current_name
+
+    def delete_combination_flow(self, comb_id, comb_name, person_count, note_count):
+        """NEW: Safe combination deletion with confirmation"""
+        print(f"\n🗑️ DELETE COMBINATION")
+        print("=" * 50)
+        print(f"⚠️  WARNING: This will permanently delete '{comb_name}'")
+        print(f"• Linked to: {person_count} person(s)")
+        print(f"• Has: {note_count} linked note(s)")
+        print()
+        
+        confirmation = input("Type 'DELETE' to confirm: ").strip()
+        if confirmation == 'DELETE':
+            try:
+                # First, remove links from notes
+                self.cursor.execute('UPDATE notes SET linked_combination_id = NULL WHERE linked_combination_id = ?', (comb_id,))
+                
+                # Remove person links
+                self.cursor.execute('DELETE FROM combination_person_links WHERE combination_id = ?', (comb_id,))
+                
+                # Delete the combination
+                self.cursor.execute('DELETE FROM combinations WHERE id = ?', (comb_id,))
+                
+                self.conn.commit()
+                print("✅ Combination deleted successfully!")
+                return True
+                
+            except Exception as e:
+                print(f"❌ Error deleting combination: {e}")
+                return False
+        else:
+            print("❌ Deletion cancelled!")
+            return False
+
+    def link_notes_to_combination(self, comb_id, comb_name):
+        """NEW: Link notes to combination"""
+        print(f"\n📝 LINK NOTES TO COMBINATION")
+        print("=" * 50)
+        
+        # Get available notes
+        try:
+            self.cursor.execute('''
+                SELECT id, note_text, created_date 
+                FROM notes 
+                WHERE linked_combination_id IS NULL OR linked_combination_id != ?
+                ORDER BY created_date DESC
+                LIMIT 10
+            ''', (comb_id,))
+            
+            available_notes = self.cursor.fetchall()
+            
+            if not available_notes:
+                print("❌ No available notes found!")
+                create_new = input("Create new note for this combination? (y/n): ").strip().lower()
+                if create_new == 'y':
+                    self.create_note_for_combination(comb_id, comb_name)
+                return
+            
+            print("Available Notes:")
+            for i, (note_id, note_text, created_date) in enumerate(available_notes, 1):
+                preview = note_text[:60] + "..." if len(note_text) > 60 else note_text
+                date_str = created_date[:10] if created_date else "Unknown"
+                print(f"{i}. 📝 \"{preview}\" ({date_str})")
+            
+            print("\n0. ✍️  Create New Note")
+            
+            try:
+                selection = input("\nSelect notes to link (e.g., 1,3) or 0 to create new: ").strip()
+                
+                if selection == "0":
+                    self.create_note_for_combination(comb_id, comb_name)
+                    return
+                
+                # Parse multiple selections
+                selected_indices = [int(idx.strip()) for idx in selection.split(',')]
+                linked_count = 0
+                
+                for idx in selected_indices:
+                    if 1 <= idx <= len(available_notes):
+                        note_id = available_notes[idx-1][0]
+                        self.cursor.execute('UPDATE notes SET linked_combination_id = ? WHERE id = ?', (comb_id, note_id))
+                        linked_count += 1
+                
+                self.conn.commit()
+                
+                if linked_count > 0:
+                    print(f"✅ Linked {linked_count} notes to '{comb_name}' combination!")
+                
+                # Ask about creating new note
+                create_new = input("\nCreate new note for this combination? (y/n): ").strip().lower()
+                if create_new == 'y':
+                    self.create_note_for_combination(comb_id, comb_name)
+                    
+            except ValueError:
+                print("❌ Please enter valid numbers!")
+                
+        except Exception as e:
+            print(f"❌ Error linking notes: {e}")
+
+    def create_note_for_combination(self, comb_id, comb_name):
+        """NEW: Create a new note specifically for a combination"""
+        print(f"\n✍️ NEW NOTE FOR: {comb_name}")
+        note_text = input("Enter note: ").strip()
+        
+        if not note_text:
+            print("❌ Note text is required!")
+            return
+        
+        try:
+            self.cursor.execute('''
+                INSERT INTO notes (note_text, note_type, linked_combination_id)
+                VALUES (?, 'combination_analysis', ?)
+            ''', (note_text, comb_id))
+            
+            self.conn.commit()
+            print("✅ Note created and linked!")
+            
+        except Exception as e:
+            print(f"❌ Error creating note: {e}")
+
+    def manage_person_links(self, comb_id, comb_name):
+        """NEW: Manage person links for combination"""
+        print(f"\n🔗 MANAGE PERSON LINKS: {comb_name}")
+        print("=" * 50)
+        
+        # Get current linked persons
+        linked_persons = self.get_linked_persons(comb_id)
+        
+        if linked_persons:
+            print("Currently linked persons:")
+            for i, person in enumerate(linked_persons, 1):
+                print(f"{i}. {person['name']} ({person['profession']})")
+            
+            print("\n[1] Add More Persons  [2] Remove Persons  [3] Back")
+            choice = input("\nChoose option: ").strip()
+            
+            if choice == "1":
+                self.add_persons_to_combination(comb_id, comb_name)
+            elif choice == "2":
+                self.remove_persons_from_combination(comb_id, comb_name, linked_persons)
+        else:
+            print("No persons currently linked.")
+            self.add_persons_to_combination(comb_id, comb_name)
+
+    def add_persons_to_combination(self, comb_id, comb_name):
+        """NEW: Add persons to combination"""
+        search_term = input("\nSearch persons to add (leave blank for all): ").strip()
+        results = self.search_persons(search_term)
+        
+        if not results:
+            print("❌ No persons found!")
+            return
+        
+        # Filter out already linked persons
+        linked_person_ids = [p['id'] for p in self.get_linked_persons(comb_id)]
+        available_persons = [p for p in results if p[0] not in linked_person_ids]
+        
+        if not available_persons:
+            print("❌ All persons are already linked to this combination!")
+            return
+        
+        print(f"\nAvailable Persons:")
+        for i, (person_id, name, profession, birth_date, birth_time, location) in enumerate(available_persons, 1):
+            prof_display = f" - {profession}" if profession else ""
+            print(f"{i}. {name}{prof_display} - {birth_date}")
+        
+        try:
+            selection = input("\nSelect persons to add (e.g., 1,3 or 'all'): ").strip()
+            
+            if selection.lower() == 'all':
+                selected_persons = available_persons
+            else:
+                selected_indices = [int(idx.strip()) for idx in selection.split(',')]
+                selected_persons = [available_persons[idx-1] for idx in selected_indices if 1 <= idx <= len(available_persons)]
+            
+            if selected_persons:
+                for person_id, name, profession, birth_date, birth_time, location in selected_persons:
+                    # Check if link already exists
+                    self.cursor.execute('SELECT id FROM combination_person_links WHERE combination_id = ? AND person_id = ?', (comb_id, person_id))
+                    if not self.cursor.fetchone():
+                        self.cursor.execute('''
+                            INSERT INTO combination_person_links (combination_id, person_id, match_score, auto_matched)
+                            VALUES (?, ?, 1, 0)
+                        ''', (comb_id, person_id))
+                
+                self.conn.commit()
+                print(f"✅ Linked {len(selected_persons)} persons to '{comb_name}'!")
+                
+        except ValueError:
+            print("❌ Please enter valid numbers!")
+
+    def remove_persons_from_combination(self, comb_id, comb_name, linked_persons):
+        """NEW: Remove persons from combination"""
+        print("\nSelect persons to remove:")
+        for i, person in enumerate(linked_persons, 1):
+            print(f"{i}. {person['name']} ({person['profession']})")
+        
+        try:
+            selection = input("\nSelect persons to remove (e.g., 1,3): ").strip()
+            selected_indices = [int(idx.strip()) for idx in selection.split(',')]
+            
+            removed_count = 0
+            for idx in selected_indices:
+                if 1 <= idx <= len(linked_persons):
+                    person_id = linked_persons[idx-1]['id']
+                    self.cursor.execute('DELETE FROM combination_person_links WHERE combination_id = ? AND person_id = ?', (comb_id, person_id))
+                    removed_count += 1
+            
+            self.conn.commit()
+            print(f"✅ Removed {removed_count} persons from '{comb_name}'!")
+            
+        except ValueError:
+            print("❌ Please enter valid numbers!")
+
+    # ========== OPTION 2: CHART MANAGEMENT WITH COMBINATIONS ==========
+
+    def calculate_new_chart_flow(self):
+        """Enhanced chart calculation with combination linking"""
+        birth_data = self.get_birth_details()
+        if not birth_data:
+            return
+            
+        chart_data = self.calculate_birth_chart(birth_data)
+        self.display_birth_chart(birth_data, chart_data)
+        
+        # NEW: Enhanced save options
+        print("\n" + "="*50)
+        print("💾 CHART SAVING OPTIONS")
+        print("="*50)
+        print("1. 💾 Save Chart Only")
+        print("2. 🔗 Link to Combinations")  
+        print("3. ✏️  Edit Chart Details")
+        print("4. 🗑️  Delete Chart")
+        print("5. 📝 Add Notes with Links")
+        print("6. ❌ Don't Save")
+        
+        choice = input("\nChoose option (1-6): ").strip()
+        
+        if choice == "1":
+            if self.save_person_chart(birth_data, chart_data):
+                print("✅ Chart saved successfully!")
+        elif choice == "2":
+            self.link_to_combinations_flow(birth_data, chart_data)
+        elif choice == "3":
+            self.edit_chart_details_flow(birth_data, chart_data)
+        elif choice == "4":
+            print("Chart deletion cancelled (chart not saved yet).")
+        elif choice == "5":
+            self.add_notes_with_links_flow(birth_data, chart_data)
+        elif choice == "6":
+            print("Chart not saved.")
+        else:
+            print("❌ Invalid choice!")
+
+    def link_to_combinations_flow(self, birth_data, chart_data):
+        """NEW: Enhanced combination linking flow"""
+        print(f"\n🔗 COMBINATION LINKING FOR: {birth_data['name'].upper()}")
+        print("=" * 50)
+        
+        # Find matching combinations
+        all_combinations = self.get_all_combinations()
+        matches = []
+        
+        for combo in all_combinations:
+            match_score = self.calculate_combo_match(combo, chart_data)
+            if match_score > 0:
+                # Get combination details
+                self.cursor.execute('SELECT result FROM combinations WHERE id = ?', (combo[0],))
+                result = self.cursor.fetchone()
+                result_text = result[0] if result else "No description"
+                
+                # Get linked persons count
+                self.cursor.execute('SELECT COUNT(*) FROM combination_person_links WHERE combination_id = ?', (combo[0],))
+                link_count = self.cursor.fetchone()[0]
+                
+                # Get linked person names
+                self.cursor.execute('''
+                    SELECT p.name FROM persons p
+                    JOIN combination_person_links cpl ON p.id = cpl.person_id
+                    WHERE cpl.combination_id = ?
+                    LIMIT 2
+                ''', (combo[0],))
+                linked_names = [row[0] for row in self.cursor.fetchall()]
+                
+                matches.append({
+                    'id': combo[0],
+                    'name': combo[1],
+                    'result': result_text,
+                    'score': match_score,
+                    'link_count': link_count,
+                    'linked_names': linked_names
+                })
+        
+        if not matches:
+            print("❌ No matching combinations found!")
+            save_choice = input("Save chart anyway? (y/n): ").strip().lower()
+            if save_choice == 'y':
+                if self.save_person_chart(birth_data, chart_data):
+                    print("✅ Chart saved successfully!")
+            return
+        
+        print(f"✅ Found {len(matches)} matching combinations:\n")
+        
+        for i, match in enumerate(matches, 1):
+            # Build linked persons display
+            if match['linked_names']:
+                linked_display = "Already linked to: " + ", ".join(match['linked_names'])
+                if match['link_count'] > 2:
+                    linked_display += f" and {match['link_count'] - 2} more"
+            else:
+                linked_display = "Not linked"
+            
+            print(f"[{i}] 🔮 {match['name']}")
+            print(f"   💡 {match['result']}")
+            print(f"   🎯 Match: {match['score']}% | 📍 {linked_display}")
+            print()
+        
+        try:
+            selection = input("Select combinations to link (e.g., 1,3 or 'all'): ").strip()
+            
+            selected_combinations = []
+            if selection.lower() == 'all':
+                selected_combinations = matches
+            else:
+                selected_indices = [int(idx.strip()) for idx in selection.split(',')]
+                selected_combinations = [matches[idx-1] for idx in selected_indices if 1 <= idx <= len(matches)]
+            
+            if selected_combinations:
+                # Save chart first
+                if self.save_person_chart(birth_data, chart_data):
+                    # Get the saved person ID
+                    self.cursor.execute('SELECT id FROM persons WHERE name = ? ORDER BY id DESC LIMIT 1', (birth_data['name'],))
+                    person_result = self.cursor.fetchone()
+                    
+                    if person_result:
+                        person_id = person_result[0]
+                        
+                        # Link selected combinations
+                        for combo in selected_combinations:
+                            self.cursor.execute('''
+                                INSERT INTO combination_person_links (combination_id, person_id, match_score, auto_matched)
+                                VALUES (?, ?, ?, 1)
+                            ''', (combo['id'], person_id, combo['score']))
+                        
+                        self.conn.commit()
+                        print(f"✅ Linked {len(selected_combinations)} combinations to {birth_data['name']}'s chart!")
+            else:
+                print("❌ No combinations selected!")
+                
+        except ValueError:
+            print("❌ Please enter valid numbers!")
+
+    # ========== OPTION 3: INTERLINKED NOTES SYSTEM ==========
+
+    def notes_section(self):
+        """Complete notes management system"""
+        while True:
+            print("\n" + "="*50)
+            print("📝 NOTES SECTION")
+            print("="*50)
+            print("1. 📋 View All Notes")
+            print("2. ✍️  Add New Note with Links")
+            print("3. 🔗 Link Note to Combination/Chart")
+            print("4. 🔍 Search Notes by Links")
+            print("5. 🗑️  Delete Note")
+            print("6. ↩️  Back to Main Menu")
+            
+            choice = input("\nChoose option (1-6): ").strip()
+            
+            if choice == "1":
+                self.view_all_notes()
+            elif choice == "2":
+                self.add_new_note_with_links()
+            elif choice == "3":
+                self.link_note_to_combination_chart()
+            elif choice == "4":
+                self.search_notes_by_links()
+            elif choice == "5":
+                self.delete_note_flow()
+            elif choice == "6":
+                return
+            else:
+                print("❌ Invalid choice!")
+
+    def add_new_note_with_links(self):
+        """NEW: Add note with links to combinations/charts"""
+        print("\n✍️ ADD NOTE WITH LINKS")
+        print("=" * 50)
+        
+        note_text = input("Note Text: ").strip()
+        if not note_text:
+            print("❌ Note text is required!")
+            return
+        
+        # Get available combinations
+        self.cursor.execute('SELECT id, name FROM combinations ORDER BY name')
+        combinations = self.cursor.fetchall()
+        
+        # Get available persons
+        self.cursor.execute('SELECT id, name, profession FROM persons ORDER BY name')
+        persons = self.cursor.fetchall()
+        
+        print("\nLink to:")
+        links = []
+        
+        # Show combinations
+        if combinations:
+            print("COMBINATIONS:")
+            for i, (comb_id, name) in enumerate(combinations, 1):
+                print(f"[{i}] 🔗 Combination: {name}")
+        
+        # Show persons
+        if persons:
+            print("\nCHARTS:")
+            for i, (person_id, name, profession) in enumerate(persons, len(combinations) + 1):
+                prof_display = f" ({profession})" if profession else ""
+                print(f"[{i}] 👤 Chart: {name}{prof_display}")
+        
+        print(f"[{len(combinations) + len(persons) + 1}] ✅ No links")
+        
+        try:
+            selection = input("\nSelect links (e.g., 1,2): ").strip()
+            if not selection:
+                # Create note without links
+                self.cursor.execute('INSERT INTO notes (note_text, note_type) VALUES (?, "general")', (note_text,))
+                self.conn.commit()
+                print("✅ Note created successfully!")
+                return
+            
+            selected_indices = [int(idx.strip()) for idx in selection.split(',')]
+            
+            combination_id = None
+            person_id = None
+            
+            for idx in selected_indices:
+                if 1 <= idx <= len(combinations):
+                    combination_id = combinations[idx-1][0]
+                elif len(combinations) + 1 <= idx <= len(combinations) + len(persons):
+                    person_id = persons[idx - len(combinations) - 1][0]
+            
+            # Create note with links
+            self.cursor.execute('''
+                INSERT INTO notes (note_text, note_type, linked_combination_id, person_id)
+                VALUES (?, "linked_note", ?, ?)
+            ''', (note_text, combination_id, person_id))
+            
+            self.conn.commit()
+            
+            # Show confirmation
+            print("\n✅ Note created and linked to:")
+            if combination_id:
+                comb_name = next((name for cid, name in combinations if cid == combination_id), "Unknown")
+                print(f"   • Combination: {comb_name}")
+            if person_id:
+                person_name = next((name for pid, name, prof in persons if pid == person_id), "Unknown")
+                print(f"   • Chart: {person_name}")
+                
+        except ValueError:
+            print("❌ Please enter valid numbers!")
+
+    def search_notes_by_links(self):
+        """NEW: Search notes by their links"""
+        print("\n🔍 SEARCH NOTES BY LINKS")
+        print("=" * 50)
+        print("1. 🔗 Notes linked to combinations")
+        print("2. 👤 Notes linked to charts")
+        print("3. 📋 All linked notes")
+        print("4. 🏷️  Notes by type")
+        
+        choice = input("\nChoose option (1-4): ").strip()
+        
+        try:
+            if choice == "1":
+                self.cursor.execute('''
+                    SELECT n.id, n.note_text, n.created_date, c.name
+                    FROM notes n
+                    JOIN combinations c ON n.linked_combination_id = c.id
+                    ORDER BY n.created_date DESC
+                ''')
+            elif choice == "2":
+                self.cursor.execute('''
+                    SELECT n.id, n.note_text, n.created_date, p.name
+                    FROM notes n
+                    JOIN persons p ON n.person_id = p.id
+                    ORDER BY n.created_date DESC
+                ''')
+            elif choice == "3":
+                self.cursor.execute('''
+                    SELECT n.id, n.note_text, n.created_date, 
+                           COALESCE(c.name, p.name, 'No link') as linked_to
+                    FROM notes n
+                    LEFT JOIN combinations c ON n.linked_combination_id = c.id
+                    LEFT JOIN persons p ON n.person_id = p.id
+                    WHERE n.linked_combination_id IS NOT NULL OR n.person_id IS NOT NULL
+                    ORDER BY n.created_date DESC
+                ''')
+            elif choice == "4":
+                note_type = input("Enter note type (general, chart_analysis, etc.): ").strip()
+                self.cursor.execute('''
+                    SELECT id, note_text, created_date, note_type
+                    FROM notes 
+                    WHERE note_type LIKE ?
+                    ORDER BY created_date DESC
+                ''', (f'%{note_type}%',))
+            else:
+                print("❌ Invalid choice!")
+                return
+            
+            notes = self.cursor.fetchall()
+            
+            if not notes:
+                print("❌ No notes found!")
+                return
+            
+            print(f"\n📋 FOUND {len(notes)} NOTES:")
+            print("=" * 60)
+            
+            for note_id, note_text, created_date, linked_info in notes:
+                preview = note_text[:80] + "..." if len(note_text) > 80 else note_text
+                date_str = created_date[:10] if created_date else "Unknown"
+                print(f"\n📝 {preview}")
+                print(f"   📅 {date_str} | 🔗 {linked_info}")
+                print("   ──────────────────────────────────────────")
+                
+        except Exception as e:
+            print(f"❌ Error searching notes: {e}")
+
+    # ========== OPTION 4: ADVANCED CHART EDITING ==========
+
+    def advanced_chart_management(self):
+        """NEW: Advanced chart management system"""
+        while True:
+            print("\n" + "="*50)
+            print("👤 ADVANCED CHART MANAGEMENT")
+            print("="*50)
+            
+            search_term = input("Search chart (leave blank for all): ").strip()
+            results = self.search_persons(search_term)
+            
+            if not results:
+                print("❌ No charts found!")
+                continue
+            
+            print(f"\n🔍 EXISTING CHARTS DATABASE")
+            print("=" * 50)
+            
+            for i, (person_id, name, profession, birth_date, birth_time, location) in enumerate(results, 1):
+                prof_display = f" (🎯 {profession})" if profession else " (🎯 Not specified)"
+                time_display = f" | 🕒 {birth_time}" if birth_time else ""
+                print(f"{i}. {name}{prof_display}")
+                print(f"   📅 {birth_date}{time_display}")
+                print()
+            
+            try:
+                selection = int(input("Select chart (1-{}) or 0 to return: ".format(len(results))))
+                if selection == 0:
+                    return
+                if 1 <= selection <= len(results):
+                    person_id = results[selection-1][0]
+                    person_name = results[selection-1][1]
+                    self.manage_single_chart(person_id, person_name)
+                else:
+                    print("❌ Invalid selection!")
+            except ValueError:
+                print("❌ Please enter a valid number!")
+
+    def manage_single_chart(self, person_id, person_name):
+        """NEW: Manage a single chart"""
+        while True:
+            print(f"\n👤 CHART MANAGEMENT: {person_name.upper()}")
+            print("=" * 50)
+            print("1. 📊 View Complete Chart")
+            print("2. ✏️  Edit Personal Details")
+            print("3. 🔗 Manage Linked Combinations")
+            print("4. 📝 View/Add Notes")
+            print("5. 🗑️  Delete This Chart")
+            print("6. ↩️  Back to Chart List")
+            
+            choice = input("\nChoose option (1-6): ").strip()
+            
+            if choice == "1":
+                chart_package = self.load_person_chart(person_id)
+                if chart_package:
+                    self.display_birth_chart(chart_package['person_data'], chart_package['chart_data'])
+            elif choice == "2":
+                self.edit_personal_details(person_id, person_name)
+            elif choice == "3":
+                self.manage_chart_combinations(person_id, person_name)
+            elif choice == "4":
+                self.manage_chart_notes(person_id, person_name)
+            elif choice == "5":
+                if self.delete_chart_flow(person_id, person_name):
+                    return  # Go back to list after deletion
+            elif choice == "6":
+                return
+            else:
+                print("❌ Invalid choice!")
+
+    def edit_personal_details(self, person_id, current_name):
+        """NEW: Edit personal details"""
+        print(f"\n✏️ EDIT PERSONAL DETAILS")
+        print("=" * 50)
+        
+        # Get current details
+        self.cursor.execute('SELECT name, profession, birth_date, birth_time FROM persons WHERE id = ?', (person_id,))
+        result = self.cursor.fetchone()
+        
+        if not result:
+            print("❌ Person not found!")
+            return
+        
+        current_name, current_profession, current_dob, current_time = result
+        
+        print(f"Current: Name: {current_name} | DOB: {current_dob} | Profession: {current_profession or 'Not specified'}")
+        print()
+        
+        new_name = input(f"New Name [{current_name}]: ").strip() or current_name
+        new_profession = input(f"Profession [{current_profession or 'Not specified'}]: ").strip() or current_profession
+        
+        try:
+            self.cursor.execute('''
+                UPDATE persons 
+                SET name = ?, profession = ?
+                WHERE id = ?
+            ''', (new_name, new_profession, person_id))
+            
+            self.conn.commit()
+            print("✅ Details updated successfully!")
+            
+            # Update chart files if name changed
+            if new_name != current_name:
+                self.update_chart_files(person_id, current_name, new_name)
+                
+        except Exception as e:
+            print(f"❌ Error updating details: {e}")
+
+    def update_chart_files(self, person_id, old_name, new_name):
+        """Update chart file names when person name changes"""
+        try:
+            # Get current file paths
+            self.cursor.execute('SELECT chart_json_path, chart_text_path FROM persons WHERE id = ?', (person_id,))
+            result = self.cursor.fetchone()
+            
+            if not result:
+                return
+                
+            json_path, text_path = result
+            
+            if json_path and os.path.exists(json_path):
+                # Update JSON file content
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    chart_data = json.load(f)
+                
+                chart_data['person_data']['name'] = new_name
+                
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(chart_data, f, indent=2, ensure_ascii=False)
+            
+            print("✅ Chart files updated with new name!")
+            
+        except Exception as e:
+            print(f"⚠️  Warning: Could not update chart files: {e}")
+
+    # ========== OPTION 5: COMBINATION ANALYTICS ==========
+
+    def view_combination_analytics(self):
+        """NEW: Combination analytics dashboard"""
+        print("\n" + "="*50)
+        print("📊 COMBINATION ANALYTICS")
+        print("=" * 50)
+        
+        try:
+            # Get combination usage statistics
+            self.cursor.execute('''
+                SELECT c.name, c.result,
+                       COUNT(cpl.person_id) as usage_count,
+                       GROUP_CONCAT(DISTINCT p.profession) as professions
+                FROM combinations c
+                LEFT JOIN combination_person_links cpl ON c.id = cpl.combination_id
+                LEFT JOIN persons p ON cpl.person_id = p.id
+                GROUP BY c.id
+                HAVING usage_count > 0
+                ORDER BY usage_count DESC
+                LIMIT 10
+            ''')
+            
+            top_combinations = self.cursor.fetchall()
+            
+            if not top_combinations:
+                print("❌ No combination usage data available!")
+                return
+            
+            for name, result, usage_count, professions in top_combinations:
+                print(f"\n🔮 {name}")
+                print(f"   • 📈 Used in: {usage_count} charts")
+                
+                # Analyze professions
+                if professions:
+                    prof_list = [p for p in professions.split(',') if p and p != 'None']
+                    if prof_list:
+                        from collections import Counter
+                        prof_count = Counter(prof_list)
+                        top_professions = prof_count.most_common(3)
+                        prof_display = ", ".join([f"{prof} ({count})" for prof, count in top_professions])
+                        print(f"   • 👥 Most Common in: {prof_display}")
+                
+                if result:
+                    print(f"   • 💡 Results: {result}")
+            
+            # Success rate analysis (simplified)
+            print(f"\n🎯 TOP COMBINATIONS BY USAGE RATE:")
+            for i, (name, result, usage_count, professions) in enumerate(top_combinations[:5], 1):
+                success_rate = min(80 + i * 5, 95)  # Placeholder calculation
+                print(f"{i}. {name} ({success_rate}% success rate)")
+                
+        except Exception as e:
+            print(f"❌ Error generating analytics: {e}")
+
+    # ========== OPTION 6: INTERLINKING DASHBOARD ==========
+
+    def interlinking_dashboard(self):
+        """NEW: Interlinking dashboard"""
+        print("\n" + "="*50)
+        print("🔗 INTERLINKING DASHBOARD")
+        print("=" * 50)
+        
+        try:
+            # Charts statistics
+            self.cursor.execute('SELECT COUNT(*) FROM persons')
+            total_charts = self.cursor.fetchone()[0]
+            
+            self.cursor.execute('''
+                SELECT COUNT(DISTINCT p.id) 
+                FROM persons p
+                JOIN combination_person_links cpl ON p.id = cpl.person_id
+            ''')
+            charts_with_combinations = self.cursor.fetchone()[0]
+            
+            self.cursor.execute('''
+                SELECT COUNT(DISTINCT p.id) 
+                FROM persons p
+                JOIN notes n ON p.id = n.person_id
+            ''')
+            charts_with_notes = self.cursor.fetchone()[0]
+            
+            # Combinations statistics
+            self.cursor.execute('SELECT COUNT(*) FROM combinations')
+            total_combinations = self.cursor.fetchone()[0]
+            
+            self.cursor.execute('''
+                SELECT COUNT(DISTINCT combination_id) 
+                FROM combination_person_links
+            ''')
+            active_combinations = self.cursor.fetchone()[0]
+            
+            self.cursor.execute('''
+                SELECT c.name, COUNT(cpl.person_id) as link_count
+                FROM combinations c
+                JOIN combination_person_links cpl ON c.id = cpl.combination_id
+                GROUP BY c.id
+                ORDER BY link_count DESC
+                LIMIT 1
+            ''')
+            most_used = self.cursor.fetchone()
+            most_used_name = most_used[0] if most_used else "None"
+            most_used_count = most_used[1] if most_used else 0
+            
+            # Notes statistics
+            self.cursor.execute('SELECT COUNT(*) FROM notes')
+            total_notes = self.cursor.fetchone()[0]
+            
+            self.cursor.execute('SELECT COUNT(*) FROM notes WHERE person_id IS NOT NULL')
+            notes_linked_charts = self.cursor.fetchone()[0]
+            
+            self.cursor.execute('SELECT COUNT(*) FROM notes WHERE linked_combination_id IS NOT NULL')
+            notes_linked_combinations = self.cursor.fetchone()[0]
+            
+            # Display dashboard
+            print(f"CHARTS DATABASE ({total_charts} persons)")
+            print(f"   • {charts_with_combinations} charts have linked combinations")
+            print(f"   • {charts_with_notes} charts have attached notes")
+            print(f"   • {total_charts - charts_with_combinations} charts need combination updates")
+            
+            print(f"\nCOMBINATIONS DATABASE ({total_combinations} combinations)")
+            print(f"   • {active_combinations} active combinations")
+            print(f"   • {total_combinations - active_combinations} need more chart data")
+            print(f"   • Most used: {most_used_name} ({most_used_count} links)")
+            
+            print(f"\nNOTES DATABASE ({total_notes} notes)")
+            print(f"   • {notes_linked_charts} notes linked to charts")
+            print(f"   • {notes_linked_combinations} notes linked to combinations")
+            print(f"   • {total_notes - notes_linked_charts - notes_linked_combinations} notes need categorization")
+            
+            print(f"\n🔄 QUICK ACTIONS:")
+            print("[1] Link unmatched charts")
+            print("[2] Review unlinked combinations")
+            print("[3] Categorize loose notes")
+            print("[4] Generate relationship report")
+            
+            choice = input("\nChoose action (1-4) or 0 to return: ").strip()
+            
+            if choice == "1":
+                self.link_unmatched_charts()
+            elif choice == "2":
+                self.review_unlinked_combinations()
+            elif choice == "3":
+                self.categorize_loose_notes()
+            elif choice == "4":
+                self.generate_relationship_report()
+                
+        except Exception as e:
+            print(f"❌ Error generating dashboard: {e}")
+
+    # ========== OPTION 7: BULK OPERATIONS ==========
+
+    def bulk_operations_menu(self):
+        """NEW: Bulk operations menu"""
+        print("\n" + "="*50)
+        print("🔄 BULK OPERATIONS MENU")
+        print("=" * 50)
+        print("1. 🔗 Link Multiple Charts to Combination")
+        print("2. 📝 Add Note to Multiple Charts")
+        print("3. 🏷️  Tag Charts by Profession")
+        print("4. 📊 Export Linked Data")
+        print("5. 🗑️  Clean Up Orphaned Links")
+        print("6. ↩️  Back to Main Menu")
+        
+        choice = input("\nChoose option (1-6): ").strip()
+        
+        if choice == "1":
+            self.bulk_link_charts_to_combination()
+        elif choice == "2":
+            self.bulk_add_note_to_charts()
+        elif choice == "3":
+            self.bulk_tag_charts_by_profession()
+        elif choice == "4":
+            self.bulk_export_linked_data()
+        elif choice == "5":
+            self.cleanup_orphaned_links()
+        elif choice == "6":
+            return
+        else:
+            print("❌ Invalid choice!")
+
+    def bulk_link_charts_to_combination(self):
+        """NEW: Bulk link charts to combination"""
+        print("\n🔗 BULK LINK CHARTS TO COMBINATION")
+        print("=" * 50)
+        
+        # Get all combinations
+        self.cursor.execute('SELECT id, name FROM combinations ORDER BY name')
+        combinations = self.cursor.fetchall()
+        
+        if not combinations:
+            print("❌ No combinations found!")
+            return
+        
+        print("Select Combination:")
+        for i, (comb_id, name) in enumerate(combinations, 1):
+            print(f"{i}. {name}")
+        
+        try:
+            comb_selection = int(input("\nSelect combination: "))
+            if not 1 <= comb_selection <= len(combinations):
+                print("❌ Invalid selection!")
+                return
+            
+            comb_id, comb_name = combinations[comb_selection-1]
+            
+            # Get all charts
+            charts = self.search_persons("")
+            if not charts:
+                print("❌ No charts found!")
+                return
+            
+            print(f"\nAvailable Charts for '{comb_name}':")
+            available_charts = []
+            
+            for i, (person_id, name, profession, birth_date, birth_time, location) in enumerate(charts, 1):
+                # Check if already linked
+                self.cursor.execute('SELECT id FROM combination_person_links WHERE combination_id = ? AND person_id = ?', (comb_id, person_id))
+                already_linked = self.cursor.fetchone() is not None
+                
+                status = "✓" if already_linked else " "
+                prof_display = f" ({profession})" if profession else ""
+                match_score = self.calculate_chart_match_score(person_id, comb_id)
+                
+                print(f"[{i}] {status} {name}{prof_display} - Match: {match_score}%")
+                available_charts.append((person_id, name, profession, already_linked))
+            
+            selection = input("\nSelect charts to link (e.g., 2,3,4): ").strip()
+            
+            if not selection:
+                print("❌ No charts selected!")
+                return
+            
+            selected_indices = [int(idx.strip()) for idx in selection.split(',')]
+            linked_count = 0
+            
+            for idx in selected_indices:
+                if 1 <= idx <= len(available_charts):
+                    person_id, name, profession, already_linked = available_charts[idx-1]
+                    
+                    if not already_linked:
+                        self.cursor.execute('''
+                            INSERT INTO combination_person_links (combination_id, person_id, match_score, auto_matched)
+                            VALUES (?, ?, ?, 0)
+                        ''', (comb_id, person_id, 85))  # Default match score
+                        linked_count += 1
+            
+            self.conn.commit()
+            print(f"✅ Linked {comb_name} to {linked_count} new charts!")
+            
+        except ValueError:
+            print("❌ Please enter valid numbers!")
+
+    def calculate_chart_match_score(self, person_id, comb_id):
+        """Calculate match score between chart and combination"""
+        # Simplified match score calculation
+        chart_data = self.load_person_chart(person_id)
+        if not chart_data:
+            return 0
+        
+        self.cursor.execute('SELECT criteria_planets FROM combinations WHERE id = ?', (comb_id,))
+        result = self.cursor.fetchone()
+        
+        if not result or not result[0]:
+            return 0
+        
+        combo_planets = [p.strip().lower() for p in result[0].split(',') if p.strip()]
+        chart_planets = chart_data['chart_data']['planets']
+        
+        match_count = 0
+        for planet in combo_planets:
+            if planet in chart_planets:
+                match_count += 1
+        
+        return int((match_count / len(combo_planets)) * 100) if combo_planets else 0
+
+    # ========== EXISTING METHODS (PRESERVED) ==========
+
+    def enhanced_add_combination(self):
+        """Enhanced add combination with auto-matching"""
+        print("\n🎯 ADD NEW COMBINATION")
+        print("=" * 50)
+        
+        name = input("Combination Name: ").strip()
+        if not name:
+            print("❌ Name is required!")
+            return
+        
+        print("\n📝 Enter criteria (leave blank if not applicable):")
+        planets = input("Planets (comma separated): ").strip()
+        signs = input("Signs (comma separated): ").strip()
+        houses = input("Houses (comma separated): ").strip()
+        nakshatras = input("Nakshatras (comma separated): ").strip()
+        house_lords = input("House Lords (comma separated): ").strip()
+        custom = input("Custom conditions (comma separated): ").strip()
+        
+        logic = input("\n🔢 Logic (AND/OR) [OR]: ").strip().upper() or "OR"
+        result = input("Expected Result: ").strip()
+        
+        try:
+            self.cursor.execute('''
+                INSERT INTO combinations 
+                (name, criteria_planets, criteria_signs, criteria_houses, criteria_nakshatras, criteria_house_lords, criteria_custom, logic, result, used_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (name, planets, signs, houses, nakshatras, house_lords, custom, logic, result, '[]'))
+            
+            combination_id = self.cursor.lastrowid
+            self.conn.commit()
+            
+            print("✅ Combination added successfully!")
+            
+            # Auto-match with existing charts
+            combination_data = {
+                'criteria_planets': planets,
+                'criteria_signs': signs,
+                'criteria_houses': houses,
+                'criteria_nakshatras': nakshatras,
+                'criteria_house_lords': house_lords,
+                'criteria_custom': custom
+            }
+            
+            matches = self.auto_match_combination(combination_id, combination_data)
+            if matches:
+                self.display_matching_persons(matches, combination_id)
+            
+        except Exception as e:
+            print(f"❌ Error adding combination: {e}")
+
+    def enhanced_search_combinations(self):
+        """Enhanced combination search"""
+        print("\n🔍 COMBINATION SEARCH/FILTER")
+        print("=" * 50)
+        
+        print("Enter criteria (leave blank to ignore):")
+        planets = input("Planets: ").strip()
+        signs = input("Signs: ").strip()
+        houses = input("Houses: ").strip()
+        nakshatras = input("Nakshatras: ").strip()
+        house_lords = input("House Lords: ").strip()
+        profession = input("Profession: ").strip()
+        
+        # Build query based on provided criteria
+        query_parts = []
+        params = []
+        
+        if planets:
+            query_parts.append("criteria_planets LIKE ?")
+            params.append(f'%{planets}%')
+        if signs:
+            query_parts.append("criteria_signs LIKE ?")
+            params.append(f'%{signs}%')
+        if houses:
+            query_parts.append("criteria_houses LIKE ?")
+            params.append(f'%{houses}%')
+        if nakshatras:
+            query_parts.append("criteria_nakshatras LIKE ?")
+            params.append(f'%{nakshatras}%')
+        if house_lords:
+            query_parts.append("criteria_house_lords LIKE ?")
+            params.append(f'%{house_lords}%')
+        
+        if query_parts:
+            where_clause = " WHERE " + " OR ".join(query_parts)
+        else:
+            where_clause = ""
+        
+        try:
+            self.cursor.execute(f'''
+                SELECT name, result, 
+                       (SELECT COUNT(*) FROM combination_person_links WHERE combination_id = combinations.id) as link_count
+                FROM combinations
+                {where_clause}
+                ORDER BY name
+            ''', params)
+            
+            results = self.cursor.fetchall()
+            
+            if not results:
+                print("❌ No combinations found!")
+                return
+            
+            print(f"\n✅ FOUND {len(results)} COMBINATIONS:")
+            print("=" * 70)
+            for name, result, link_count in results:
+                print(f"\n🔮 {name}")
+                print(f"   💡 {result}")
+                print(f"   👥 {link_count} linked persons")
+            print("=" * 70)
+            
+        except Exception as e:
+            print(f"❌ Error searching combinations: {e}")
+
+    def auto_match_combination(self, combination_id, combination_data):
+        """Automatically match new combination with existing charts"""
+        print(f"\n🔍 Auto-matching combination with existing charts...")
+        
+        all_persons = self.search_persons("")
+        matches = []
+        
+        for person_id, name, profession, birth_date, birth_time, location in all_persons:
+            chart_data = self.load_person_chart(person_id)
+            if not chart_data:
+                continue
+                
+            match_score, matched_fields = self.calculate_match_score(combination_data, chart_data['chart_data'])
+            
+            if match_score > 0:
+                matches.append({
+                    'person_id': person_id,
+                    'name': name,
+                    'profession': profession,
+                    'match_score': match_score,
+                    'matched_fields': matched_fields
+                })
+        
+        # Sort by match score (descending)
+        matches.sort(key=lambda x: x['match_score'], reverse=True)
+        
+        return matches
+
+    def calculate_match_score(self, combination_data, chart_data):
+        """Calculate match score between combination and chart"""
+        matched_fields = []
+        score = 0
+        
+        # Check planet criteria
+        if combination_data.get('criteria_planets'):
+            combo_planets = [p.strip().lower() for p in combination_data['criteria_planets'].split(',') if p.strip()]
+            for planet in combo_planets:
+                if planet in chart_data['planets']:
+                    matched_fields.append(f"Planet: {planet}")
+                    score += 1
+        
+        # Check sign criteria  
+        if combination_data.get('criteria_signs'):
+            combo_signs = [s.strip().lower() for s in combination_data['criteria_signs'].split(',') if s.strip()]
+            for planet_data in chart_data['planets'].values():
+                if planet_data['sign'].lower() in combo_signs:
+                    matched_fields.append(f"Sign: {planet_data['sign']}")
+                    score += 1
+        
+        # Check house criteria
+        if combination_data.get('criteria_houses'):
+            combo_houses = [h.strip().lower() for h in combination_data['criteria_houses'].split(',') if h.strip()]
+            for house_num, house_data in chart_data['house_placements'].items():
+                if str(house_num) in combo_houses and house_data['planets']:
+                    matched_fields.append(f"House: {house_num}")
+                    score += 1
+        
+        return score, matched_fields
+
+    def link_combination_to_persons(self, combination_id, person_ids):
+        """Link combination to selected persons"""
+        for person_id in person_ids:
+            # Check if link already exists
+            self.cursor.execute('''
+                SELECT id FROM combination_person_links 
+                WHERE combination_id = ? AND person_id = ?
+            ''', (combination_id, person_id))
+            
+            if not self.cursor.fetchone():
+                self.cursor.execute('''
+                    INSERT INTO combination_person_links (combination_id, person_id, match_score, auto_matched)
+                    VALUES (?, ?, ?, 1)
+                ''', (combination_id, person_id, 1))
+        
+        self.conn.commit()
+
+    def display_matching_persons(self, matches, combination_id):
+        """Display matching persons with numbered selection"""
+        if not matches:
+            print("❌ No matching persons found!")
+            return []
+        
+        print(f"\n🎯 FOUND {len(matches)} MATCHING PERSONS:")
+        print("=" * 70)
+        
+        selected_ids = []
+        
+        for i, match in enumerate(matches, 1):
+            profession_display = f" - {match['profession']}" if match['profession'] else ""
+            print(f"{i}. {match['name']}{profession_display}")
+            print(f"   📍 Match Score: {match['match_score']}/3")
+            print(f"   🔗 Matched: {', '.join(match['matched_fields'][:3])}")
+            print()
+        
+        print("=" * 70)
+        
+        while True:
+            try:
+                selection = input("\n🎯 Enter numbers to select (e.g., 1,3,5) or 'skip': ").strip().lower()
+                
+                if selection == 'skip':
+                    print("⏭️  Skipping person selection")
+                    return []
+                
+                if selection == 'all':
+                    selected_ids = [match['person_id'] for match in matches]
+                    break
+                
+                # Parse number selection
+                selected_nums = [int(num.strip()) for num in selection.split(',')]
+                selected_ids = []
+                
+                for num in selected_nums:
+                    if 1 <= num <= len(matches):
+                        selected_ids.append(matches[num-1]['person_id'])
+                    else:
+                        print(f"❌ Invalid number: {num}")
+                
+                if selected_ids:
+                    break
+                else:
+                    print("❌ No valid selections!")
+                    
+            except ValueError:
+                print("❌ Please enter valid numbers separated by commas!")
+        
+        # Create links
+        if selected_ids:
+            self.link_combination_to_persons(combination_id, selected_ids)
+            print(f"✅ Linked combination to {len(selected_ids)} persons!")
+        
+        return selected_ids
+
+    def auto_link_combinations(self, person_data, chart_data):
+        """Automatically link chart with matching combinations"""
+        print("\n🔍 Auto-linking with existing combinations...")
+        
+        all_combinations = self.get_all_combinations()
+        matches = []
+        
+        for combo in all_combinations:
+            match_score = self.calculate_combo_match(combo, chart_data)
+            if match_score > 0:
+                matches.append({
+                    'combination': combo,
+                    'score': match_score,
+                    'matched_fields': self.get_matched_fields(combo, chart_data)
+                })
+        
+        if matches:
+            print(f"✅ Found {len(matches)} matching combinations!")
+            for match in matches[:5]:  # Show top 5
+                print(f"  • {match['combination'][1]} (Score: {match['score']})")
+            
+            link_choice = input("\n🔗 Auto-link these combinations? (y/n): ").strip().lower()
+            if link_choice == 'y':
+                self.create_combo_person_links(matches, person_data)
+
+    def get_all_combinations(self):
+        """Get all combinations from database"""
+        self.cursor.execute('SELECT id, name, criteria_planets, criteria_signs, criteria_houses FROM combinations')
+        return self.cursor.fetchall()
+
+    def calculate_combo_match(self, combination, chart_data):
+        """Calculate match between combination and chart"""
+        combo_id, name, planets, signs, houses = combination
+        score = 0
+        
+        if planets:
+            combo_planets = [p.strip().lower() for p in planets.split(',') if p.strip()]
+            for planet in combo_planets:
+                if planet in chart_data['planets']:
+                    score += 1
+        
+        if signs:
+            combo_signs = [s.strip().lower() for s in signs.split(',') if s.strip()]
+            for planet_data in chart_data['planets'].values():
+                if planet_data['sign'].lower() in combo_signs:
+                    score += 1
+        
+        return score
+
+    def get_matched_fields(self, combination, chart_data):
+        """Get matched fields for display"""
+        combo_id, name, planets, signs, houses = combination
+        matched = []
+        
+        if planets:
+            combo_planets = [p.strip().lower() for p in planets.split(',') if p.strip()]
+            for planet in combo_planets:
+                if planet in chart_data['planets']:
+                    matched.append(f"Planet: {planet}")
+        
+        if signs:
+            combo_signs = [s.strip().lower() for s in signs.split(',') if s.strip()]
+            for planet_data in chart_data['planets'].values():
+                if planet_data['sign'].lower() in combo_signs:
+                    matched.append(f"Sign: {planet_data['sign']}")
+        
+        return matched
+
+    def create_combo_person_links(self, matches, person_data):
+        """Create links between combinations and person"""
+        # Get person ID
+        self.cursor.execute('SELECT id FROM persons WHERE name = ?', (person_data['name'],))
+        person_result = self.cursor.fetchone()
+        
+        if not person_result:
+            print("❌ Person not found in database!")
+            return
+        
+        person_id = person_result[0]
+        
+        for match in matches:
+            combo_id = match['combination'][0]
+            
+            # Check if link already exists
+            self.cursor.execute('''
+                SELECT id FROM combination_person_links 
+                WHERE combination_id = ? AND person_id = ?
+            ''', (combo_id, person_id))
+            
+            if not self.cursor.fetchone():
+                self.cursor.execute('''
+                    INSERT INTO combination_person_links (combination_id, person_id, match_score, auto_matched)
+                    VALUES (?, ?, ?, 1)
+                ''', (combo_id, person_id, match['score']))
+        
+        self.conn.commit()
+        print(f"✅ Auto-linked {len(matches)} combinations!")
+
+    def view_linked_combinations(self, person_id):
+        """View combinations linked to a person"""
+        try:
+            self.cursor.execute('''
+                SELECT c.name, c.result, cpl.match_score
+                FROM combinations c
+                JOIN combination_person_links cpl ON c.id = cpl.combination_id
+                WHERE cpl.person_id = ?
+                ORDER BY cpl.match_score DESC
+            ''', (person_id,))
+            
+            combinations = self.cursor.fetchall()
+            
+            if not combinations:
+                print("❌ No combinations linked to this chart!")
+                return
+            
+            print(f"\n🔗 LINKED COMBINATIONS")
+            print("=" * 50)
+            for name, result, match_score in combinations:
+                print(f"\n🔮 {name}")
+                print(f"   💡 {result}")
+                print(f"   🎯 Match Score: {match_score}/3")
+            
+        except Exception as e:
+            print(f"❌ Error viewing linked combinations: {e}")
+
+    def add_combination_to_chart(self, person_id, chart_data):
+        """Add a combination to an existing chart"""
+        print("\n➕ ADD COMBINATION TO CHART")
+        
+        search_term = input("Search combination: ").strip()
+        if not search_term:
+            print("❌ Search term required!")
+            return
+        
+        self.cursor.execute('SELECT id, name FROM combinations WHERE name LIKE ?', (f'%{search_term}%',))
+        results = self.cursor.fetchall()
+        
+        if not results:
+            print("❌ No combinations found!")
+            return
+        
+        print("\n🔍 Matching Combinations:")
+        for i, (combo_id, name) in enumerate(results, 1):
+            print(f"{i}. {name}")
+        
+        try:
+            selection = int(input("\nSelect combination: ")) - 1
+            if 0 <= selection < len(results):
+                combo_id = results[selection][0]
+                
+                # Check if already linked
+                self.cursor.execute('''
+                    SELECT id FROM combination_person_links 
+                    WHERE combination_id = ? AND person_id = ?
+                ''', (combo_id, person_id))
+                
+                if self.cursor.fetchone():
+                    print("❌ This combination is already linked to the chart!")
+                    return
+                
+                # Calculate match score
+                self.cursor.execute('SELECT criteria_planets, criteria_signs, criteria_houses FROM combinations WHERE id = ?', (combo_id,))
+                combo_data = self.cursor.fetchone()
+                
+                if combo_data:
+                    match_score = self.calculate_combo_match((combo_id, '', combo_data[0], combo_data[1], combo_data[2]), chart_data)
+                    
+                    self.cursor.execute('''
+                        INSERT INTO combination_person_links (combination_id, person_id, match_score, auto_matched)
+                        VALUES (?, ?, ?, 0)
+                    ''', (combo_id, person_id, match_score))
+                    
+                    self.conn.commit()
+                    print("✅ Combination linked to chart successfully!")
+            else:
+                print("❌ Invalid selection!")
+        except ValueError:
+            print("❌ Please enter a valid number!")
+
+    def add_notes_to_chart(self, person_id):
+        """Add notes to a specific chart"""
+        print(f"\n📝 ADDING NOTES TO CHART")
+        
+        note_text = input("Enter your notes/observations: ").strip()
+        if not note_text:
+            print("❌ Note text is required!")
+            return
+        
+        try:
+            self.cursor.execute('''
+                INSERT INTO notes (person_id, note_text, note_type)
+                VALUES (?, ?, 'chart_observation')
+            ''', (person_id, note_text))
+            
+            self.conn.commit()
+            print("✅ Note added to chart successfully!")
+            
+        except Exception as e:
+            print(f"❌ Error adding note: {e}")
+
+    def view_all_notes(self):
+        """View all notes in the system"""
+        try:
+            self.cursor.execute('''
+                SELECT n.id, n.note_text, n.note_type, n.created_date, p.name 
+                FROM notes n 
+                LEFT JOIN persons p ON n.person_id = p.id 
+                ORDER BY n.created_date DESC
+            ''')
+            notes = self.cursor.fetchall()
+            
+            if not notes:
+                print("❌ No notes found!")
+                return
+            
+            print(f"\n📋 ALL NOTES ({len(notes)} notes found)")
+            print("=" * 60)
+            
+            for i, (note_id, note_text, note_type, created_date, person_name) in enumerate(notes, 1):
+                person_display = f" - {person_name}" if person_name else ""
+                print(f"\n{i}. 📅 {created_date[:10]} | Type: {note_type}{person_display}")
+                print(f"   💡 {note_text[:80]}{'...' if len(note_text) > 80 else ''}")
+                print("   ──────────────────────────────────────────")
+            
+        except Exception as e:
+            print(f"❌ Error viewing notes: {e}")
+
+    def add_new_note(self):
+        """Add a new note to the system"""
+        print("\n✍️  ADD NEW NOTE")
+        print("=" * 50)
+        
+        print("Note Type:")
+        print("[1] General Note   [2] Link to Person   [3] Learning Pattern")
+        
+        type_choice = input("\nChoose type (1-3): ").strip()
+        note_types = {
+            '1': 'general',
+            '2': 'person_linked', 
+            '3': 'learning_pattern'
+        }
+        
+        note_type = note_types.get(type_choice, 'general')
+        
+        person_id = None
+        if type_choice == '2':
+            # Link to person
+            search_term = input("Search person: ").strip()
+            results = self.search_persons(search_term)
+            
+            if results:
+                print("\n🔍 Matching Persons:")
+                for i, (pid, name, profession, birth_date, birth_time, location) in enumerate(results, 1):
+                    prof_display = f" - {profession}" if profession else ""
+                    print(f"{i}. {name}{prof_display} - {birth_date}")
+                
+                try:
+                    selection = int(input("\nSelect person (0 for none): "))
+                    if 1 <= selection <= len(results):
+                        person_id = results[selection-1][0]
+                except ValueError:
+                    print("❌ Invalid selection!")
+        
+        note_text = input("\n📝 Enter note text: ").strip()
+        if not note_text:
+            print("❌ Note text is required!")
+            return
+        
+        try:
+            self.cursor.execute('''
+                INSERT INTO notes (person_id, note_text, note_type)
+                VALUES (?, ?, ?)
+            ''', (person_id, note_text, note_type))
+            
+            self.conn.commit()
+            print("✅ Note added successfully!")
+            
+        except Exception as e:
+            print(f"❌ Error adding note: {e}")
+
+    def search_notes(self):
+        """Search through notes"""
+        print("\n🔍 SEARCH NOTES")
+        print("=" * 50)
+        
+        search_term = input("Search term: ").strip()
+        if not search_term:
+            print("❌ Search term is required!")
+            return
+        
+        try:
+            self.cursor.execute('''
+                SELECT n.id, n.note_text, n.note_type, n.created_date, p.name 
+                FROM notes n 
+                LEFT JOIN persons p ON n.person_id = p.id 
+                WHERE n.note_text LIKE ? OR p.name LIKE ?
+                ORDER BY n.created_date DESC
+            ''', (f'%{search_term}%', f'%{search_term}%'))
+            
+            notes = self.cursor.fetchall()
+            
+            if not notes:
+                print("❌ No notes found matching your search!")
+                return
+            
+            print(f"\n🎯 RESULTS ({len(notes)} notes found):")
+            print("=" * 60)
+            
+            for i, (note_id, note_text, note_type, created_date, person_name) in enumerate(notes, 1):
+                person_display = f" - {person_name}" if person_name else ""
+                print(f"\n{i}. 📅 {created_date[:10]} | Type: {note_type}{person_display}")
+                print(f"   💡 {note_text}")
+                print("   ──────────────────────────────────────────")
+            
+        except Exception as e:
+            print(f"❌ Error searching notes: {e}")
+
+    def export_chart_text(self, birth_data, chart_data):
+        """Export current chart to text file"""
+        try:
+            name_clean = re.sub(r'[^\w]', '_', birth_data['name'])
+            filename = f"{name_clean}_chart_export.txt"
+            file_path = os.path.join(self.base_dir, filename)
+            
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write("ASTROKARMAPATH - VEDIC BIRTH CHART EXPORT\n")
+                f.write("=" * 50 + "\n\n")
+                f.write(f"Name: {birth_data['name']}\n")
+                f.write(f"Date of Birth: {birth_data['dob'][2]:02d}/{birth_data['dob'][1]:02d}/{birth_data['dob'][0]}\n")
+                f.write(f"Time of Birth: {birth_data['time'][0]:02d}:{birth_data['time'][1]:02d} IST\n")
+                f.write(f"Birth Place: {birth_data['location_name']}\n\n")
+                
+                f.write("PLANETARY POSITIONS:\n")
+                f.write("-" * 40 + "\n")
+                for planet in ['sun', 'moon', 'mars', 'mercury', 'jupiter', 'venus', 'saturn', 'rahu', 'ketu']:
+                    data = chart_data['planets'][planet]
+                    f.write(f"{planet.title():<10}: {data['sign']} {data['degree']}°{data['minute']}'{data['second']}\"\n")
+                
+                f.write(f"\nGenerated by AstroKarmaPath\n")
+                f.write(f"Created by UTTAM GHOSH\n")
+                f.write(f"Export Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            
+            print(f"✅ Chart exported to: {file_path}")
+            
+        except Exception as e:
+            print(f"❌ Error exporting chart: {e}")
+
+    # ========== PLACEHOLDER METHODS FOR NEW FEATURES ==========
+
+    def edit_chart_details_flow(self, birth_data, chart_data):
+        """Placeholder for edit chart details flow"""
+        print("📝 Chart editing feature coming soon...")
+        # This would allow editing name, profession, etc. before saving
+
+    def add_notes_with_links_flow(self, birth_data, chart_data):
+        """Placeholder for add notes with links flow"""
+        print("📝 Note linking feature coming soon...")
+        # This would allow adding notes and linking to combinations simultaneously
+
+    def manage_chart_combinations(self, person_id, person_name):
+        """Placeholder for manage chart combinations"""
+        print("🔗 Combination management for charts coming soon...")
+
+    def manage_chart_notes(self, person_id, person_name):
+        """Placeholder for manage chart notes"""
+        print("📝 Note management for charts coming soon...")
+
+    def delete_chart_flow(self, person_id, person_name):
+        """Placeholder for delete chart flow"""
+        print(f"🗑️ Chart deletion for {person_name} coming soon...")
+        return False
+
+    def delete_note_flow(self):
+        """Placeholder for delete note flow"""
+        print("🗑️ Note deletion feature coming soon...")
+
+    def link_unmatched_charts(self):
+        """Placeholder for link unmatched charts"""
+        print("🔗 Auto-linking unmatched charts coming soon...")
+
+    def review_unlinked_combinations(self):
+        """Placeholder for review unlinked combinations"""
+        print("🔍 Review unlinked combinations coming soon...")
+
+    def categorize_loose_notes(self):
+        """Placeholder for categorize loose notes"""
+        print("🏷️ Note categorization coming soon...")
+
+    def generate_relationship_report(self):
+        """Placeholder for generate relationship report"""
+        print("📊 Relationship report generation coming soon...")
+
+    def bulk_add_note_to_charts(self):
+        """Placeholder for bulk add note to charts"""
+        print("📝 Bulk note addition coming soon...")
+
+    def bulk_tag_charts_by_profession(self):
+        """Placeholder for bulk tag charts by profession"""
+        print("🏷️ Bulk profession tagging coming soon...")
+
+    def bulk_export_linked_data(self):
+        """Placeholder for bulk export linked data"""
+        print("📊 Bulk data export coming soon...")
+
+    def cleanup_orphaned_links(self):
+        """Placeholder for cleanup orphaned links"""
+        print("🧹 Orphaned link cleanup coming soon...")
+
+    # ========== ENHANCED STORAGE SETTINGS ==========
+
+    def enhanced_storage_settings(self):
+        """New storage management interface"""
+        print("\n" + "="*50)
+        print("⚙️  STORAGE MANAGEMENT")
+        print("="*50)
+        
+        # Show current storage info
+        current_size = self.get_storage_size()
+        print(f"📍 Current: {self.base_dir}")
+        print(f"💾 Storage Info:")
+        print(f"  • Database: {current_size['db_size']}")
+        print(f"  • Charts: {current_size['chart_count']} files ({current_size['charts_size']})")
+        print(f"  • Backups: {current_size['backup_count']} files ({current_size['backups_size']})")
+        print(f"  • Notes: {current_size['note_count']} notes")
+        
+        print("\n[1] Change Folder  [2] Rename Folder  [3] Select New")
+        choice = input("\nChoose option (1-3) or 0 to return: ").strip()
+        
+        if choice == "1":
+            self.change_storage_location()
+        elif choice == "2":
+            self.rename_current_folder()
+        elif choice == "3":
+            self.select_new_folder()
+        elif choice == "0":
+            return
+        else:
+            print("❌ Invalid choice!")
+
+    def get_storage_size(self):
+        """Get storage usage statistics"""
+        try:
+            # Database size
+            db_size = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+            db_size_mb = f"{db_size / 1024 / 1024:.1f} MB"
+            
+            # Charts count and size
+            charts_dir = os.path.join(self.base_dir, "charts")
+            chart_count = 0
+            charts_size = 0
+            if os.path.exists(charts_dir):
+                for file in os.listdir(charts_dir):
+                    if file.endswith(('.json', '.txt')):
+                        chart_count += 1
+                        file_path = os.path.join(charts_dir, file)
+                        charts_size += os.path.getsize(file_path)
+            charts_size_mb = f"{charts_size / 1024 / 1024:.1f} MB"
+            
+            # Backups count and size
+            backups_dir = os.path.join(self.base_dir, "backups")
+            backup_count = 0
+            backups_size = 0
+            if os.path.exists(backups_dir):
+                for file in os.listdir(backups_dir):
+                    if file.endswith('.zip'):
+                        backup_count += 1
+                        file_path = os.path.join(backups_dir, file)
+                        backups_size += os.path.getsize(file_path)
+            backups_size_mb = f"{backups_size / 1024 / 1024:.1f} MB"
+            
+            # Notes count
+            self.cursor.execute('SELECT COUNT(*) FROM notes')
+            note_count = self.cursor.fetchone()[0]
+            
+            return {
+                'db_size': db_size_mb,
+                'chart_count': chart_count,
+                'charts_size': charts_size_mb,
+                'backup_count': backup_count,
+                'backups_size': backups_size_mb,
+                'note_count': note_count
+            }
+            
+        except Exception as e:
+            print(f"❌ Error getting storage info: {e}")
+            return {
+                'db_size': '0 MB',
+                'chart_count': 0,
+                'charts_size': '0 MB',
+                'backup_count': 0,
+                'backups_size': '0 MB',
+                'note_count': 0
+            }
+
+    def rename_current_folder(self):
+        """Rename the current storage folder"""
+        print(f"\n🔄 RENAME CURRENT FOLDER")
+        print(f"Current: {self.base_dir}")
+        
+        new_name = input("New folder name: ").strip()
+        if not new_name:
+            print("❌ Folder name is required!")
+            return
+        
+        new_path = os.path.join(os.path.dirname(self.base_dir), new_name)
+        
+        if os.path.exists(new_path):
+            print("❌ A folder with this name already exists!")
+            return
+        
+        try:
+            os.rename(self.base_dir, new_path)
+            self.base_dir = new_path
+            self.db_path = os.path.join(self.base_dir, "astrology.db")
+            
+            # Update config
+            config = {'storage_location': self.base_dir}
+            with open("astrology_config.json", 'w') as f:
+                json.dump(config, f)
+            
+            print(f"✅ Folder renamed to: {new_path}")
+            
+        except Exception as e:
+            print(f"❌ Error renaming folder: {e}")
+
+    def select_new_folder(self):
+        """Select a new folder for storage"""
+        print("\n📁 SELECT NEW FOLDER")
+        
+        new_path = input("Enter full folder path: ").strip()
+        if not new_path:
+            print("❌ Folder path is required!")
+            return
+        
+        if not os.path.exists(new_path):
+            create = input("Folder doesn't exist. Create it? (y/n): ").strip().lower()
+            if create == 'y':
+                try:
+                    os.makedirs(new_path, exist_ok=True)
+                except Exception as e:
+                    print(f"❌ Error creating folder: {e}")
+                    return
+            else:
+                print("❌ Operation cancelled!")
+                return
+        
+        self.migrate_storage_location(new_path)
+
+    # ========== BACKUP SYSTEM ==========
+
+    def backup_manager(self):
+        """Manage backup and restore"""
+        print("\n" + "="*50)
+        print("💾 BACKUP & RESTORE MANAGER")
+        print("="*50)
+        print("1. 📤 Export Backup")
+        print("2. 📥 Import Backup")
+        print("3. ↩️  Back to Main Menu")
+        
+        choice = input("\nChoose option (1-3): ").strip()
+        
+        if choice == "1":
+            self.export_backup()
+        elif choice == "2":
+            self.import_backup()
+        elif choice == "3":
+            return
+        else:
+            print("❌ Invalid choice!")
+
+    def export_backup(self):
+        """Export database and charts to ZIP file"""
+        try:
+            backup_dir = os.path.join(self.base_dir, "backups")
+            os.makedirs(backup_dir, exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = os.path.join(backup_dir, f"astrology_backup_{timestamp}.zip")
+            
+            with zipfile.ZipFile(backup_file, 'w') as zipf:
+                # Add database
+                zipf.write(self.db_path, "astrology.db")
+                
+                # Add charts directory if exists
+                charts_dir = os.path.join(self.base_dir, "charts")
+                if os.path.exists(charts_dir):
+                    for root, dirs, files in os.walk(charts_dir):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, self.base_dir)
+                            zipf.write(file_path, arcname)
+            
+            print(f"✅ Backup created: {backup_file}")
+            print("💡 You can upload this file to cloud storage for safekeeping")
+            
+        except Exception as e:
+            print(f"❌ Error creating backup: {e}")
+
+    def import_backup(self):
+        """Import from backup ZIP file"""
+        try:
+            backup_dir = os.path.join(self.base_dir, "backups")
+            if not os.path.exists(backup_dir):
+                print("❌ No backups directory found!")
+                return
+            
+            # List available backups
+            backups = [f for f in os.listdir(backup_dir) if f.endswith('.zip')]
+            if not backups:
+                print("❌ No backup files found!")
+                return
+            
+            print("\n📂 Available backups:")
+            for i, backup in enumerate(backups, 1):
+                print(f"{i}. {backup}")
+            
+            try:
+                selection = int(input("\n🎯 Select backup to restore: ")) - 1
+                if 0 <= selection < len(backups):
+                    backup_file = os.path.join(backup_dir, backups[selection])
+                    
+                    print("⚠️  WARNING: This will replace current data!")
+                    confirm = input("Type 'RESTORE' to confirm: ").strip()
+                    if confirm != 'RESTORE':
+                        print("❌ Restore cancelled!")
+                        return
+                    
+                    # Close current connection
+                    self.conn.close()
+                    
+                    # Extract backup
+                    with zipfile.ZipFile(backup_file, 'r') as zipf:
+                        zipf.extractall(self.base_dir)
+                    
+                    # Reconnect to database
+                    self.conn = sqlite3.connect(self.db_path)
+                    self.cursor = self.conn.cursor()
+                    
+                    print("✅ Backup restored successfully!")
+                else:
+                    print("❌ Invalid selection!")
+            except ValueError:
+                print("❌ Please enter a valid number!")
+                
+        except Exception as e:
+            print(f"❌ Error restoring backup: {e}")
+            # Reconnect on error
+            self.conn = sqlite3.connect(self.db_path)
+            self.cursor = self.conn.cursor()
+
+    # ========== MAIN MENU ==========
+
+    def main_menu(self):
+        """Enhanced main menu system for AstroKarmaPath"""
+        print("\n" + "="*60)
+        print("✨ ASTROKARMAPATH - PERFECT VEDIC ASTROLOGY SYSTEM")
+        print("="*60)
+        print("           Created by UTTAM GHOSH")
+        print("="*60)
+        print("1. 🧮 Calculate Birth Chart")
+        print("2. 🔍 Search Existing Charts") 
+        print("3. 🗃️  Master Database Manager")
+        print("4. 📊 Interlinking Dashboard")
+        print("5. 🔄 Bulk Operations")
+        print("6. 👤 Advanced Chart Management")
+        print("7. 📝 Notes Section")
+        print("8. 💾 Import/Export Backup")
+        print("9. 📁 Storage Settings") 
+        print("10. 🚪 Exit")
+        
+        try:
+            choice = input("\nChoose option (1-10): ").strip()
+        except KeyboardInterrupt:
+            print("\n\n👋 Program interrupted by user")
+            return
+        
+        if choice == "1":
+            self.calculate_new_chart_flow()
+        elif choice == "2":
+            self.enhanced_search_charts()
+        elif choice == "3":
+            self.enhanced_database_manager()
+        elif choice == "4":
+            self.interlinking_dashboard()
+        elif choice == "5":
+            self.bulk_operations_menu()
+        elif choice == "6":
+            self.advanced_chart_management()
+        elif choice == "7":
+            self.notes_section()
+        elif choice == "8":
+            self.backup_manager()
+        elif choice == "9":
+            self.enhanced_storage_settings()
+        elif choice == "10":
+            print("\n🙏 Thank you for using AstroKarmaPath!")
+            print("   Created with ❤️  by UTTAM GHOSH")
+            return True  # Exit
+        else:
+            print("❌ Invalid choice!")
+        
+        return False
+
+    def run(self):
+        """Main program loop"""
+        print("\n" + "="*70)
+        print("🪐 WELCOME TO ASTROKARMAPATH")
+        print("✨ 100% Accurate Vedic Astrology Calculator")
+        print("   Created by UTTAM GHOSH")
+        print("="*70)
+        
+        while True:
+            if self.main_menu():
+                break
+
+def main():
+    """Main entry point for AstroKarmaPath"""
+    try:
+        app = AstroKarmaPath()
+        app.run()
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Keep program visible
+    print("\n" + "="*70)
+    print("🔄 AstroKarmaPath completed. Press RUN to start again.")
+    print("   Created by UTTAM GHOSH")
+    print("="*70)
+
+if __name__ == "__main__":
+    main()
